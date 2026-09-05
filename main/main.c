@@ -142,6 +142,9 @@ static lv_obj_t *bar_status = NULL;
 
 static volatile bool esperando_confirmacion = false;
 static volatile bool transmitiendo_archivo = false;
+static volatile bool secuencia_activa = false;
+static volatile TickType_t ultima_recepcion_secuencia = 0;
+static volatile TickType_t inicio_parpadeo_secuencia = 0;
 
 // Mutex para evitar colisiones de lectura/escritura/borrado en el archivo
 static SemaphoreHandle_t file_mutex = NULL;
@@ -192,11 +195,37 @@ static void append_str_to_line(const char *str) {
     line_overflow = true;
 }
 
+// Detecta si la cadena de entrada contiene la cabecera de "Alert Technologies"
+// y devuelve true si se encuentra, false en caso contrario.
+static bool alerta_tecnologias_recibida(const char *stream) {
+    if (stream == NULL)
+        return false;
+
+    const char *header = "Alert Technologies, Model ";
+    const char *model_start = strstr(stream, header);
+    if (model_start == NULL)
+        return false;
+
+    // Busca ", Version " a partir de donde termina el encabezado del modelo
+    const char *version_start = strstr(model_start + strlen(header), ", Version ");
+    
+    return version_start != NULL;
+}
+
 // ---------------------------------------------------------------------------
 // Procesador byte a byte
 // ---------------------------------------------------------------------------
 static void procesar_loop_secuencia(uint8_t *buf, size_t len) {
-  hardware_ws2812_set_color(0, 255, 0); // Verde indica procesamiento activo
+  TickType_t ahora = xTaskGetTickCount();
+
+  if (!secuencia_activa) {
+    secuencia_activa = true;
+    inicio_parpadeo_secuencia = ahora;
+    hardware_ws2812_set_color(0, 255, 0);
+    ESP_LOGI(TAG, "Primera entrada en la secuencia. LED verde encendido.");
+  }
+  ultima_recepcion_secuencia = ahora;
+  
   for (size_t i = 0; i < len; i++) {
     uint8_t b = buf[i];
 
@@ -382,6 +411,38 @@ static void ui_update_task(void *arg) {
   vTaskDelete(NULL);
 }
 
+static void secuencia_led_task(void *arg) {
+  int estado_led = -1;
+
+  while (1) {
+    if (secuencia_activa) {
+      TickType_t ahora = xTaskGetTickCount();
+      TickType_t silencio = ahora - ultima_recepcion_secuencia;
+      bool error = silencio > pdMS_TO_TICKS(30000);
+      TickType_t periodo = error ? pdMS_TO_TICKS(250) : pdMS_TO_TICKS(4000);
+      TickType_t fase = error ? ahora : ahora - inicio_parpadeo_secuencia;
+      bool encendido = (fase % periodo) < (error ? pdMS_TO_TICKS(125) : pdMS_TO_TICKS(2000));
+      int nuevo_estado = error ? (encendido ? 2 : 0) : (encendido ? 1 : 0);
+
+      if (nuevo_estado != estado_led) {
+        if (nuevo_estado == 2) {
+          hardware_ws2812_set_color(255, 0, 0);
+        } else if (nuevo_estado == 1) {
+          hardware_ws2812_set_color(0, 255, 0);
+        } else {
+          hardware_ws2812_set_color(0, 0, 0);
+        }
+        estado_led = nuevo_estado;
+
+        if (error && nuevo_estado == 2)
+          ESP_LOGE(TAG, "Sin datos UART durante mas de 30 segundos. LED rojo parpadeando.");
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Tareas Principales
 // ---------------------------------------------------------------------------
@@ -537,6 +598,7 @@ static void rx_task(void *arg) {
   uint8_t estado_grabado = 0;
   const char *target = "seq #\",\"ld cella\",\"     dac\",\"    temp\",\"    tare\"";
   size_t target_len = strlen(target);
+  bool alerta_led_azul = false;
 
   char overlap_buf[64] = {0};
   size_t overlap_len = 0;
@@ -546,7 +608,7 @@ static void rx_task(void *arg) {
 
     if (rxBytes > 0) {
       ESP_LOG_BUFFER_HEXDUMP(TAG, data, rxBytes, ESP_LOG_WARN);
-      hardware_ws2812_set_color(0, 0, 255); // Azul indica recepción de datos
+    
       vTaskDelay(pdMS_TO_TICKS(50));
 
       bool ignorar_grabacion = false;
@@ -555,6 +617,14 @@ static void rx_task(void *arg) {
       memcpy(stream_buf, overlap_buf, overlap_len);
       memcpy(stream_buf + overlap_len, data, rxBytes);
       stream_buf[total_stream_len] = '\0';
+
+      // Verificar si se ha recibido la cabecera de "Alert Technologies"
+      // Si se detecta, encender el LED azul y registrar el evento
+      if (!alerta_led_azul && alerta_tecnologias_recibida(stream_buf)) {
+        hardware_ws2812_set_color(0, 0, 255);
+        alerta_led_azul = true;
+        ESP_LOGI(TAG, "Alerta de tecnologias detectada. LED azul encendido.");
+      }
 
       // 1. Manejo de Comandos RS-232
       if (esperando_confirmacion) {
@@ -622,7 +692,7 @@ static void rx_task(void *arg) {
               ESP_LOGE(TAG, "Cabecera descartada parcialmente por falta de espacio en RAM.");
 
             // Transición a la captura continua de tramas
-            hardware_ws2812_set_color(0, 255, 0); // Verde indica captura activa
+           
             ESP_LOGI(TAG, "Cabecera detectada. Iniciando captura de tramas...");
             estado_grabado = 2;
             subestado_loop = WAIT_CRLF_1;
@@ -659,9 +729,8 @@ static void rx_task(void *arg) {
           memcpy(overlap_buf, stream_buf, overlap_len);
         }
       }
-    }else {
-    hardware_ws2812_set_color(0, 0, 0); // Apaga LED si no hay datos  
     }
+    
   }
 
   free(data);
@@ -735,6 +804,7 @@ void app_main(void) {
   if (xTaskCreate(rx_task, "uart_rx_task", 4096, NULL, 5, NULL) != pdPASS ||
       xTaskCreate(flash_writer_task, "flash_writer_task", 4096, NULL, 4, NULL) != pdPASS ||
       xTaskCreate(ui_update_task, "ui_update_task", 2048, NULL, 3, NULL) != pdPASS ||
+      xTaskCreate(secuencia_led_task, "secuencia_led_task", 2048, NULL, 3, NULL) != pdPASS ||
       xTaskCreate(console_keyboard_task, "console_keyboard_task", 2048, NULL, 5, NULL) != pdPASS) {
     ESP_LOGE(TAG, "No se pudieron crear todas las tareas del sistema.");
     return;

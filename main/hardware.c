@@ -83,7 +83,7 @@ static void hardware_init_ws2812(void) {
   ESP_ERROR_CHECK(rmt_new_bytes_encoder(&encoder_config, &ws2812_encoder));
   ESP_ERROR_CHECK(rmt_enable(ws2812_channel));
 
-  hardware_ws2812_set_color(255, 0, 0);
+  hardware_ws2812_set_color(255, 0, 0); // Rojo al inicio
   ESP_LOGI(TAG, "WS2812 inicializado en GPIO%d", WS2812_GPIO);
 }
 
