@@ -2,16 +2,24 @@
 
 #include "hardware.h"
 #include "driver/gpio.h" // IWYU pragma: keep
+#include "driver/rmt_encoder.h"
+#include "driver/rmt_tx.h"
 
 #include "driver/uart.h"
 #include "esp_littlefs.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h" // IWYU pragma: keep
 #include "freertos/task.h"
 #include <stddef.h>
+#include <inttypes.h>
 //#include "esp_rom_sys.h"
 #include "hal/gpio_types.h"
 #include <stdlib.h>
+#include <stdint.h>
+#include "esp_lcd_panel_vendor.h"  // IWYU pragma: keep
+#include "esp_lcd_panel_ops.h"
 
 
 static const char *TAG = "HARDWARE";
@@ -19,6 +27,8 @@ static const char *TAG = "HARDWARE";
 
 
 lv_disp_t *lvgl_disp = NULL;
+static rmt_channel_handle_t ws2812_channel = NULL;
+static rmt_encoder_handle_t ws2812_encoder = NULL;
 
 
 
@@ -42,19 +52,55 @@ void hardware_init_gpio(void) {
       .intr_type = GPIO_INTR_DISABLE,
   };
   gpio_config(&bk_gpio_config);
-  gpio_set_level(PIN_NUM_BK_LIGHT, 1);
+  gpio_set_level(PIN_NUM_BK_LIGHT, 0); // Apaga la luz de fondo al inicio
+}
+
+static void hardware_init_ws2812(void) {
+  const rmt_tx_channel_config_t channel_config = {
+      .gpio_num = WS2812_GPIO,
+      .clk_src = RMT_CLK_SRC_DEFAULT,
+      .resolution_hz = 10 * 1000 * 1000,
+      .mem_block_symbols = 64,
+      .trans_queue_depth = 1,
+  };
+  ESP_ERROR_CHECK(rmt_new_tx_channel(&channel_config, &ws2812_channel));
+
+  const rmt_bytes_encoder_config_t encoder_config = {
+      .bit0 = {
+          .duration0 = 3,
+          .level0 = 1,
+          .duration1 = 9,
+          .level1 = 0,
+      },
+      .bit1 = {
+          .duration0 = 6,
+          .level0 = 1,
+          .duration1 = 6,
+          .level1 = 0,
+      },
+      .flags = {.msb_first = 1},
+  };
+  ESP_ERROR_CHECK(rmt_new_bytes_encoder(&encoder_config, &ws2812_encoder));
+  ESP_ERROR_CHECK(rmt_enable(ws2812_channel));
+
+  hardware_ws2812_set_color(255, 0, 0);
+  ESP_LOGI(TAG, "WS2812 inicializado en GPIO%d", WS2812_GPIO);
+}
+
+void hardware_ws2812_set_color(uint8_t red, uint8_t green, uint8_t blue) {
+  if (ws2812_channel == NULL || ws2812_encoder == NULL) {
+    ESP_LOGW(TAG, "WS2812 no esta inicializado");
+    return;
+  }
+
+  uint8_t grb[3] = {green, red, blue};
+  const rmt_transmit_config_t transmit_config = {.loop_count = 0};
+  ESP_ERROR_CHECK(rmt_transmit(ws2812_channel, ws2812_encoder, grb, sizeof(grb), &transmit_config));
+  ESP_ERROR_CHECK(rmt_tx_wait_all_done(ws2812_channel, -1));
+  esp_rom_delay_us(80);
 }
 
 void hardware_init_uart(void) {
-  
-  gpio_config_t io_conf = {.pin_bit_mask = (1ULL << UART_TX_PIN),
-                           .mode = GPIO_MODE_OUTPUT,
-                           .pull_up_en = GPIO_PULLUP_DISABLE,
-                           .pull_down_en = GPIO_PULLDOWN_ENABLE,
-                           .intr_type = GPIO_INTR_DISABLE};
-  gpio_config(&io_conf);
-  gpio_set_level(UART_TX_PIN, 0); // Forzar nivel bajo de reposo
-
   uart_config_t uart_config = {
       .baud_rate = BAUD_RATE,
       .data_bits = UART_DATA_8_BITS,
@@ -147,7 +193,7 @@ lv_disp_t *hardware_init_display(void) {
 static esp_err_t init_littlefs(void) {
   ESP_LOGI(TAG, "Inicializando LittleFS");
 
-  esp_vfs_littlefs_conf_t conf = {.base_path = "/archivos", .partition_label = "archivos", .format_if_mount_failed = true, .dont_mount = false};
+  esp_vfs_littlefs_conf_t conf = {.base_path = "/archivos", .partition_label = "archivos", .format_if_mount_failed = false, .dont_mount = false};
 
   esp_err_t ret = esp_vfs_littlefs_register(&conf);
 
@@ -171,6 +217,7 @@ static esp_err_t init_littlefs(void) {
 void hardware_init_all(void) {
   ESP_ERROR_CHECK(init_littlefs());
   hardware_init_gpio();
+  hardware_init_ws2812();
   hardware_init_uart();
   hardware_init_display();
  

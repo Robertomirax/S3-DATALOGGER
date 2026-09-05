@@ -1,15 +1,18 @@
+//-------------------------------- main.c --------------------------------
+#include "driver/gpio.h"
+#include "driver/uart.h"
+#include "esp_log.h"
+#include "font/lv_font.h"
+#include "freertos/FreeRTOS.h" // IWYU pragma: keep
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+#include "hardware.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "freertos/FreeRTOS.h" // IWYU pragma: keep
-#include "freertos/semphr.h"
-#include "freertos/task.h"
-#include "driver/uart.h"
-#include "esp_log.h"
-#include "hardware.h"
-#include "font/lv_font.h"
+
 
 // ---------------------------------------------------------------------------
 // Constantes y Definiciones
@@ -19,7 +22,7 @@ static const char *TAG_KB = "TECLADO";
 static const char *TAG_FLASH = "FLASH_WRITER";
 static const char *log_path = "/archivos/log_uart.txt";
 
-//static const char DL_HEADER1[] = "\x55\x55\x55\x55\x55\x55\x55";
+// static const char DL_HEADER1[] = "\x55\x55\x55\x55\x55\x55\x55";
 static const char DL_HEADER2[] = "\r\n\r\nAlert Technologies\r\nDATALOGGER "
                                  "VER1.04\r\n\nMemory Used...08%\r\n";
 
@@ -68,20 +71,58 @@ static size_t ring_buffer_write(const uint8_t *data, size_t len) {
   return bytes_written;
 }
 
-static size_t ring_buffer_read(uint8_t *out_buf, size_t max_len) {
+static bool ring_buffer_write_all(const uint8_t *data, size_t len) {
+  size_t offset = 0;
+  TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(5000);
+
+  while (offset < len) {
+    size_t written = ring_buffer_write(data + offset, len - offset);
+    offset += written;
+    if (offset == len)
+      return true;
+    if (xTaskGetTickCount() >= deadline)
+      break;
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+
+  ESP_LOGE(TAG, "No se pudo guardar el bloque completo en RAM: %u/%u bytes", (unsigned int)offset, (unsigned int)len);
+  return false;
+}
+
+static size_t ring_buffer_peek(uint8_t *out_buf, size_t max_len) {
   if (xSemaphoreTake(rb.mutex, portMAX_DELAY) != pdTRUE)
     return 0;
 
   size_t bytes_read = 0;
-  while (bytes_read < max_len && rb.count > 0) {
-    out_buf[bytes_read] = rb.buffer[rb.tail];
-    rb.tail = (rb.tail + 1) % RING_BUF_SIZE;
-    rb.count--;
-    bytes_read++;
+  size_t index = rb.tail;
+  while (bytes_read < max_len && bytes_read < rb.count) {
+    out_buf[bytes_read++] = rb.buffer[index];
+    index = (index + 1) % RING_BUF_SIZE;
   }
 
   xSemaphoreGive(rb.mutex);
   return bytes_read;
+}
+
+static size_t ring_buffer_drop(size_t len) {
+  if (xSemaphoreTake(rb.mutex, portMAX_DELAY) != pdTRUE)
+    return 0;
+
+  size_t bytes_dropped = len < rb.count ? len : rb.count;
+  rb.tail = (rb.tail + bytes_dropped) % RING_BUF_SIZE;
+  rb.count -= bytes_dropped;
+
+  xSemaphoreGive(rb.mutex);
+  return bytes_dropped;
+}
+
+static void ring_buffer_clear(void) {
+  if (xSemaphoreTake(rb.mutex, portMAX_DELAY) == pdTRUE) {
+    rb.head = 0;
+    rb.tail = 0;
+    rb.count = 0;
+    xSemaphoreGive(rb.mutex);
+  }
 }
 
 static size_t ring_buffer_get_count(void) {
@@ -99,8 +140,8 @@ static size_t ring_buffer_get_count(void) {
 static lv_obj_t *lbl_status = NULL;
 static lv_obj_t *bar_status = NULL;
 
-static bool esperando_confirmacion = false;
-static bool transmitiendo_archivo = false;
+static volatile bool esperando_confirmacion = false;
+static volatile bool transmitiendo_archivo = false;
 
 // Mutex para evitar colisiones de lectura/escritura/borrado en el archivo
 static SemaphoreHandle_t file_mutex = NULL;
@@ -124,10 +165,12 @@ static int linea = 0x00;
 static char line_buf[128];
 static size_t line_idx = 0;
 static size_t pos_flag_tara = 0;
+static bool line_overflow = false;
 
 static void reset_line_buffer(void) {
   line_idx = 0;
   pos_flag_tara = 0;
+  line_overflow = false;
   memset(line_buf, 0, sizeof(line_buf));
 }
 
@@ -135,6 +178,8 @@ static void append_char_to_line(char c) {
   if (line_idx < sizeof(line_buf) - 1) {
     line_buf[line_idx++] = c;
     line_buf[line_idx] = '\0';
+  } else {
+    line_overflow = true;
   }
 }
 
@@ -143,12 +188,15 @@ static void append_str_to_line(const char *str) {
     line_buf[line_idx++] = *str++;
   }
   line_buf[line_idx] = '\0';
+  if (*str != '\0')
+    line_overflow = true;
 }
 
 // ---------------------------------------------------------------------------
 // Procesador byte a byte
 // ---------------------------------------------------------------------------
 static void procesar_loop_secuencia(uint8_t *buf, size_t len) {
+  hardware_ws2812_set_color(0, 255, 0); // Verde indica procesamiento activo
   for (size_t i = 0; i < len; i++) {
     uint8_t b = buf[i];
 
@@ -215,14 +263,19 @@ static void procesar_loop_secuencia(uint8_t *buf, size_t len) {
         break;
 
       ESP_LOGI(TAG, "Byte Tare: 0x%02X", b);
+      if (line_overflow) {
+        ESP_LOGW(TAG, "Linea descartada: excede %u bytes", (unsigned int)(sizeof(line_buf) - 1));
+        subestado_loop = WAIT_CRLF_1;
+        break;
+      }
       if (b == '1' && pos_flag_tara < line_idx) {
         line_buf[pos_flag_tara] = '1';
       }
 
       // Depositar línea procesada en el Ring Buffer de RAM
       if (line_idx > 0) {
-        ring_buffer_write((uint8_t *)line_buf, line_idx);
-        ESP_LOGI(TAG, "Añadido a RAM Ring Buffer: %s", line_buf);
+        if (ring_buffer_write_all((uint8_t *)line_buf, line_idx))
+          ESP_LOGI(TAG, "Añadido a RAM Ring Buffer: %s", line_buf);
       }
 
       subestado_loop = WAIT_CRLF_1;
@@ -231,7 +284,8 @@ static void procesar_loop_secuencia(uint8_t *buf, size_t len) {
       if ((linea) % 256 == 0) {
         char seq_buf[32];
         int seq_len = snprintf(seq_buf, sizeof(seq_buf), "\r\nSeq#..%05d", linea);
-        ring_buffer_write((uint8_t *)seq_buf, seq_len);
+        if (!ring_buffer_write_all((uint8_t *)seq_buf, seq_len))
+          ESP_LOGE(TAG, "Secuencia de control descartada parcialmente.");
         ESP_LOGI(TAG, "Añadida línea de control a RAM: %s", seq_buf);
       }
       break;
@@ -265,12 +319,18 @@ static void flash_writer_task(void *arg) {
         FILE *f = fopen(log_path, "a+");
         if (f != NULL) {
           while (ring_buffer_get_count() > 0) {
-            size_t bytes_to_read = ring_buffer_read(write_buf, TEMP_WRITE_BUF_SIZE);
+            size_t bytes_to_read = ring_buffer_peek(write_buf, TEMP_WRITE_BUF_SIZE);
             if (bytes_to_read > 0) {
-              fwrite(write_buf, 1, bytes_to_read, f);
+              size_t bytes_written = fwrite(write_buf, 1, bytes_to_read, f);
+              if (bytes_written != bytes_to_read) {
+                ESP_LOGE(TAG_FLASH, "Error escribiendo log: %u/%u bytes", (unsigned int)bytes_written, (unsigned int)bytes_to_read);
+                break;
+              }
+              ring_buffer_drop(bytes_written);
             }
           }
-          fflush(f);
+          if (fflush(f) != 0 || ferror(f))
+            ESP_LOGE(TAG_FLASH, "Error confirmando escritura del log.");
           fclose(f);
           ESP_LOGI(TAG_FLASH, "Volcado de RAM a Flash realizado correctamente.");
         } else {
@@ -331,7 +391,7 @@ void console_keyboard_task(void *arg) {
   while (1) {
     int c = getchar();
 
-    if (c == 'b') {
+    if (c == 'B') {
       printf("\r\n[ALERTA] Solicitud de borrado.\r\nWill clear data\r\nAre you sure? y/n \r\n");
       fflush(stdout);
 
@@ -346,6 +406,8 @@ void console_keyboard_task(void *arg) {
               FILE *f = fopen(log_path, "w");
               if (f != NULL) {
                 fclose(f);
+                ring_buffer_clear();
+                reset_line_buffer();
                 ESP_LOGI(TAG_KB, "Archivo borrado.");
                 printf("RAM test successful\r\n\r\nDone\r\n");
               } else {
@@ -368,12 +430,43 @@ void console_keyboard_task(void *arg) {
       gpio_set_level(PIN_NUM_BK_LIGHT, 0); // Apaga display
     }
 
+    if (c == 'r') {
+      hardware_ws2812_set_color(255, 0, 0);
+      ESP_LOGI("LED", "rojo");
+    }
+
+    if (c == 'g') {
+      hardware_ws2812_set_color(0, 255, 0);
+      ESP_LOGI("LED", "verde");
+    }
+
+    if (c == 'b') {
+      hardware_ws2812_set_color(0, 0, 255);
+      ESP_LOGI("LED", "azul");
+    }
+
+    if (c == 'n') {
+      hardware_ws2812_set_color(0, 0, 0);
+      ESP_LOGI("LED", "apagado");
+    }
+
+    if (c == 'w') {
+      hardware_ws2812_set_color(255, 255, 255);
+      ESP_LOGI("LED", "blanco");
+    }
+
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
 static void tx_file_task(void *arg) {
-  transmitiendo_archivo = true;
+  uint8_t *tx_buffer = (uint8_t *)malloc(UART_BUF_SIZE);
+  if (tx_buffer == NULL) {
+    ESP_LOGE(TAG, "No se pudo reservar el buffer de transmision.");
+    transmitiendo_archivo = false;
+    vTaskDelete(NULL);
+    return;
+  }
 
   vTaskDelay(pdMS_TO_TICKS(10000));
 
@@ -382,17 +475,32 @@ static void tx_file_task(void *arg) {
   }
 
   if (xSemaphoreTake(file_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
-    FILE *f = fopen(log_path, "r");
+    FILE *f = fopen(log_path, "a+");
     if (f != NULL) {
-      uint8_t *tx_buffer = (uint8_t *)malloc(UART_BUF_SIZE);
-      if (tx_buffer != NULL) {
-        size_t bytes_read = 0;
-        while ((bytes_read = fread(tx_buffer, 1, UART_BUF_SIZE, f)) > 0) {
-          uart_write_bytes(UART_PORT_NUM, (const char *)tx_buffer, bytes_read);
-          uart_wait_tx_done(UART_PORT_NUM, pdMS_TO_TICKS(1000));
+      while (ring_buffer_get_count() > 0) {
+        size_t bytes_to_write = ring_buffer_peek(tx_buffer, UART_BUF_SIZE);
+        if (bytes_to_write == 0)
+          break;
+        size_t bytes_written = fwrite(tx_buffer, 1, bytes_to_write, f);
+        if (bytes_written != bytes_to_write) {
+          ESP_LOGE(TAG, "Error guardando datos pendientes antes de transmitir.");
+          break;
         }
-        free(tx_buffer);
+        ring_buffer_drop(bytes_written);
       }
+      fflush(f);
+      fclose(f);
+
+      f = fopen(log_path, "r");
+    }
+    if (f != NULL) {
+      size_t bytes_read = 0;
+      while ((bytes_read = fread(tx_buffer, 1, UART_BUF_SIZE, f)) > 0) {
+        uart_write_bytes(UART_PORT_NUM, (const char *)tx_buffer, bytes_read);
+        uart_wait_tx_done(UART_PORT_NUM, pdMS_TO_TICKS(1000));
+      }
+      if (ferror(f))
+        ESP_LOGE(TAG, "Error leyendo archivo log para transmision.");
       fclose(f);
     } else {
       ESP_LOGE(TAG, "Error abriendo archivo log para lectura");
@@ -402,10 +510,12 @@ static void tx_file_task(void *arg) {
 
   const char *msg = "\r\n\r\nChangeBaud->300\r\n\r\n";
   uart_write_bytes(UART_PORT_NUM, msg, strlen(msg));
-  uart_wait_tx_done(UART_PORT_NUM, pdMS_TO_TICKS(500));
+  if (uart_wait_tx_done(UART_PORT_NUM, pdMS_TO_TICKS(1500)) != ESP_OK)
+    ESP_LOGW(TAG, "Timeout esperando el mensaje de cambio de baudrate.");
 
   uart_set_baudrate(UART_PORT_NUM, 300);
 
+  free(tx_buffer);
   transmitiendo_archivo = false;
   vTaskDelete(NULL);
 }
@@ -436,6 +546,8 @@ static void rx_task(void *arg) {
 
     if (rxBytes > 0) {
       ESP_LOG_BUFFER_HEXDUMP(TAG, data, rxBytes, ESP_LOG_WARN);
+      hardware_ws2812_set_color(0, 0, 255); // Azul indica recepción de datos
+      vTaskDelay(pdMS_TO_TICKS(50));
 
       bool ignorar_grabacion = false;
       size_t total_stream_len = overlap_len + rxBytes;
@@ -446,7 +558,13 @@ static void rx_task(void *arg) {
 
       // 1. Manejo de Comandos RS-232
       if (esperando_confirmacion) {
-        char resp = data[0];
+        char resp = 0;
+        for (int i = 0; i < rxBytes; i++) {
+          if (data[i] == 'y' || data[i] == 'Y' || data[i] == 'n' || data[i] == 'N') {
+            resp = (char)data[i];
+            break;
+          }
+        }
         if (resp == 'y' || resp == 'Y') {
           uart_write_bytes(UART_PORT_NUM, "Self Diag ...Waiting\r\n", 22);
 
@@ -454,6 +572,8 @@ static void rx_task(void *arg) {
             FILE *f_clr = fopen(log_path, "w");
             if (f_clr != NULL) {
               fclose(f_clr);
+              ring_buffer_clear();
+              reset_line_buffer();
               uart_write_bytes(UART_PORT_NUM, "RAM test successful\r\n\r\nDone\r\n", 29);
             }
             xSemaphoreGive(file_mutex);
@@ -466,9 +586,13 @@ static void rx_task(void *arg) {
 
       } else if (strstr(stream_buf, "send") != NULL) {
         if (!transmitiendo_archivo) {
+          transmitiendo_archivo = true;
           const char *cambio = "ChangeBaud->4800 in 10Sec\r\n";
           uart_write_bytes(UART_PORT_NUM, cambio, strlen(cambio));
-          xTaskCreate(tx_file_task, "tx_file_task", 4096, NULL, 5, NULL);
+          if (xTaskCreate(tx_file_task, "tx_file_task", 4096, NULL, 5, NULL) != pdPASS) {
+            transmitiendo_archivo = false;
+            ESP_LOGE(TAG, "No se pudo crear la tarea de transmision.");
+          }
         }
         ignorar_grabacion = true;
         overlap_len = 0;
@@ -494,9 +618,12 @@ static void rx_task(void *arg) {
                 (stream_match_idx >= overlap_len) ? (stream_match_idx - overlap_len + target_len) : (target_len - (overlap_len - stream_match_idx));
 
             // Guardar la cabecera en la RAM
-            ring_buffer_write(data, data_match_end_idx);
+            if (!ring_buffer_write_all(data, data_match_end_idx))
+              ESP_LOGE(TAG, "Cabecera descartada parcialmente por falta de espacio en RAM.");
 
             // Transición a la captura continua de tramas
+            hardware_ws2812_set_color(0, 255, 0); // Verde indica captura activa
+            ESP_LOGI(TAG, "Cabecera detectada. Iniciando captura de tramas...");
             estado_grabado = 2;
             subestado_loop = WAIT_CRLF_1;
             last_byte = 0x00;
@@ -507,7 +634,8 @@ static void rx_task(void *arg) {
             }
           } else {
             // Guardar texto inicial antes de la cabecera
-            ring_buffer_write(data, rxBytes);
+            if (!ring_buffer_write_all(data, rxBytes))
+              ESP_LOGE(TAG, "Datos UART descartados parcialmente por falta de espacio en RAM.");
           }
         } else if (estado_grabado == 2) {
           // Captura continua activa: procesar todos los bytes entrantes
@@ -531,6 +659,8 @@ static void rx_task(void *arg) {
           memcpy(overlap_buf, stream_buf, overlap_len);
         }
       }
+    }else {
+    hardware_ws2812_set_color(0, 0, 0); // Apaga LED si no hay datos  
     }
   }
 
@@ -584,26 +714,35 @@ void create_ui(void) {
 void app_main(void) {
   ESP_LOGI(TAG, "Inicializando Hardware y Estructuras de Memoria...");
 
-  
-
   file_mutex = xSemaphoreCreateMutex();
+  if (file_mutex == NULL) {
+    ESP_LOGE(TAG, "No se pudo crear el mutex de archivos.");
+    return;
+  }
   ring_buffer_init();
+  if (rb.mutex == NULL) {
+    ESP_LOGE(TAG, "No se pudo crear el mutex del ring buffer.");
+    return;
+  }
 
   hardware_init_all();
   ESP_LOGI(TAG, "Creando Interfaz de Usuario...");
   create_ui();
 
-  //vTaskDelay(pdMS_TO_TICKS(100));
+  // vTaskDelay(pdMS_TO_TICKS(100));
 
   // Creación de tareas FreeRTOS
-  xTaskCreate(rx_task, "uart_rx_task", 4096, NULL, 5, NULL);
-  xTaskCreate(flash_writer_task, "flash_writer_task", 4096, NULL, 4, NULL);
-  xTaskCreate(ui_update_task, "ui_update_task", 2048, NULL, 3, NULL);
-  xTaskCreate(console_keyboard_task, "console_keyboard_task", 2048, NULL, 5, NULL);
+  if (xTaskCreate(rx_task, "uart_rx_task", 4096, NULL, 5, NULL) != pdPASS ||
+      xTaskCreate(flash_writer_task, "flash_writer_task", 4096, NULL, 4, NULL) != pdPASS ||
+      xTaskCreate(ui_update_task, "ui_update_task", 2048, NULL, 3, NULL) != pdPASS ||
+      xTaskCreate(console_keyboard_task, "console_keyboard_task", 2048, NULL, 5, NULL) != pdPASS) {
+    ESP_LOGE(TAG, "No se pudieron crear todas las tareas del sistema.");
+    return;
+  }
 
-  //vTaskDelay(pdMS_TO_TICKS(100));
- // uart_write_bytes(UART_PORT_NUM, DL_HEADER1, strlen(DL_HEADER1));
- // vTaskDelay(pdMS_TO_TICKS(50));
+  // vTaskDelay(pdMS_TO_TICKS(100));
+  // uart_write_bytes(UART_PORT_NUM, DL_HEADER1, strlen(DL_HEADER1));
+  // vTaskDelay(pdMS_TO_TICKS(50));
   uart_write_bytes(UART_PORT_NUM, DL_HEADER2, strlen(DL_HEADER2));
 
   vTaskDelete(NULL);

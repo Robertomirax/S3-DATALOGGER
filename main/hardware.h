@@ -3,13 +3,15 @@
 #ifndef HARDWARE_H
 #define HARDWARE_H
 
-#include "driver/gpio.h"
-#include "driver/uart.h"
-#include "driver/spi_master.h"
-#include "esp_lcd_panel_vendor.h"
-#include "esp_lcd_panel_ops.h"
-#include "esp_lvgl_port.h"
-#include "lvgl.h"
+#include <stdint.h>
+
+//#include "driver/gpio.h"
+//#include "driver/uart.h"
+//#include "driver/spi_master.h"
+//#include "esp_lcd_panel_vendor.h"
+//#include "esp_lcd_panel_ops.h"
+#include "esp_lvgl_port.h"  // IWYU pragma: keep
+//#include "lvgl.h"
 
 
 #ifdef __cplusplus
@@ -25,6 +27,7 @@ extern "C" {
 
 // --- OTROS PINES ---
  #define BLINK_GPIO        GPIO_NUM_8
+ #define WS2812_GPIO       GPIO_NUM_48
 
 // pines y resolución del display st7789
 #define LCD_HOST          SPI2_HOST
@@ -46,6 +49,7 @@ void hardware_init_gpio(void);
 void hardware_init_uart(void);
 void hardware_init_all(void);
 lv_disp_t* hardware_init_display(void);
+void hardware_ws2812_set_color(uint8_t red, uint8_t green, uint8_t blue);
 
 
 
