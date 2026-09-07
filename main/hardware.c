@@ -1,4 +1,6 @@
 //------------------------------ hardware.c --------------------------------
+// Implementación de la inicialización del hardware del datalogger.
+// Aquí se configura la capa UART, la salida del LED RGB y el montaje de LittleFS.
 
 #include "hardware.h"
 #include "driver/gpio.h" // IWYU pragma: keep
@@ -21,8 +23,7 @@ static const char *TAG = "HARDWARE";
 static rmt_channel_handle_t ws2812_channel = NULL;
 static rmt_encoder_handle_t ws2812_encoder = NULL;
 
-
-
+// Inicializa el LED RGB WS2812B usando el periférico RMT.
 static void hardware_init_ws2812(void) {
   const rmt_tx_channel_config_t channel_config = {
       .gpio_num = WS2812_GPIO,
@@ -57,6 +58,7 @@ static void hardware_init_ws2812(void) {
   ESP_LOGI(TAG, "WS2812 inicializado en GPIO%d", WS2812_GPIO);
 }
 
+// Envía un color RGB al LED WS2812B usando el protocolo de datos RMT.
 void hardware_ws2812_set_color(uint8_t red, uint8_t green, uint8_t blue) {
   if (ws2812_channel == NULL || ws2812_encoder == NULL) {
     ESP_LOGW(TAG, "WS2812 no esta inicializado");
@@ -70,6 +72,7 @@ void hardware_ws2812_set_color(uint8_t red, uint8_t green, uint8_t blue) {
   esp_rom_delay_us(80);
 }
 
+// Configura el puerto UART para la comunicación con la celda de carga.
 void hardware_init_uart(void) {
   uart_config_t uart_config = {
       .baud_rate = BAUD_RATE,
@@ -84,14 +87,14 @@ void hardware_init_uart(void) {
   ESP_ERROR_CHECK(uart_set_pin(UART_PORT_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
   ESP_ERROR_CHECK(uart_driver_install(UART_PORT_NUM, UART_BUF_SIZE * 2, 0, 0, NULL, 0));
 
-  // 2. Limpiar rigurosamente cualquier byte residual en hardware/software
+  // Limpia cualquier byte residual de UART para evitar ruidos en el arranque.
   ESP_ERROR_CHECK(uart_flush_input(UART_PORT_NUM));
   ESP_ERROR_CHECK(uart_flush(UART_PORT_NUM));
 
   ESP_LOGI(TAG, "UART1 inicializada en GPIO18 (RX) y GPIO17 (TX)");
 }
 
-// Configurar y montar LittleFS
+// Monta la partición LittleFS usada para guardar el log del datalogger.
 static esp_err_t init_littlefs(void) {
   ESP_LOGI(TAG, "Inicializando LittleFS");
 
@@ -116,10 +119,10 @@ static esp_err_t init_littlefs(void) {
   return ESP_OK;
 }
 
+// Inicializa toda la capa de hardware del sistema en el orden correcto.
 void hardware_init_all(void) {
   ESP_ERROR_CHECK(init_littlefs());
-  
+
   hardware_init_ws2812();
   hardware_init_uart();
- 
 }

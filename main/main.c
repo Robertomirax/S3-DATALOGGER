@@ -6,6 +6,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "hardware.h"
+#include <errno.h> // IWYU pragma: keep
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -40,14 +41,25 @@ typedef struct {
 
 static ring_buffer_t rb;
 
+// Verifica que el mutex del buffer circular haya sido inicializado.
+static bool ring_buffer_ready(void) { return rb.mutex != NULL; }
+
+// Inicializa el buffer circular y crea el mutex de protección.
 static void ring_buffer_init(void) {
   rb.head = 0;
   rb.tail = 0;
   rb.count = 0;
   rb.mutex = xSemaphoreCreateMutex();
+  if (rb.mutex == NULL) {
+    ESP_LOGE(TAG, "No se pudo crear el mutex del ring buffer.");
+  }
 }
 
+// Escribe bytes al buffer circular protegidos por mutex.
 static size_t ring_buffer_write(const uint8_t *data, size_t len) {
+  if (!ring_buffer_ready() || data == NULL || len == 0)
+    return 0;
+
   if (xSemaphoreTake(rb.mutex, portMAX_DELAY) != pdTRUE)
     return 0;
 
@@ -68,7 +80,11 @@ static size_t ring_buffer_write(const uint8_t *data, size_t len) {
   return bytes_written;
 }
 
+// Intenta guardar un bloque completo en RAM, reintentando si el buffer está ocupado.
 static bool ring_buffer_write_all(const uint8_t *data, size_t len) {
+  if (!ring_buffer_ready() || data == NULL || len == 0)
+    return false;
+
   size_t offset = 0;
   TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(5000);
 
@@ -86,7 +102,11 @@ static bool ring_buffer_write_all(const uint8_t *data, size_t len) {
   return false;
 }
 
+// Copia datos del buffer circular hacia un buffer externo sin consumirlos.
 static size_t ring_buffer_peek(uint8_t *out_buf, size_t max_len) {
+  if (!ring_buffer_ready() || out_buf == NULL || max_len == 0)
+    return 0;
+
   if (xSemaphoreTake(rb.mutex, portMAX_DELAY) != pdTRUE)
     return 0;
 
@@ -101,7 +121,11 @@ static size_t ring_buffer_peek(uint8_t *out_buf, size_t max_len) {
   return bytes_read;
 }
 
+// Elimina bytes ya procesados del buffer circular y avanza la cola.
 static size_t ring_buffer_drop(size_t len) {
+  if (!ring_buffer_ready())
+    return 0;
+
   if (xSemaphoreTake(rb.mutex, portMAX_DELAY) != pdTRUE)
     return 0;
 
@@ -113,7 +137,11 @@ static size_t ring_buffer_drop(size_t len) {
   return bytes_dropped;
 }
 
+// Vacía el contenido del buffer circular para reiniciar el almacenamiento en RAM.
 static void ring_buffer_clear(void) {
+  if (!ring_buffer_ready())
+    return;
+
   if (xSemaphoreTake(rb.mutex, portMAX_DELAY) == pdTRUE) {
     rb.head = 0;
     rb.tail = 0;
@@ -122,8 +150,12 @@ static void ring_buffer_clear(void) {
   }
 }
 
+// Devuelve cuántos bytes hay pendientes actualmente en el buffer circular.
 static size_t ring_buffer_get_count(void) {
   size_t count = 0;
+  if (!ring_buffer_ready())
+    return count;
+
   if (xSemaphoreTake(rb.mutex, portMAX_DELAY) == pdTRUE) {
     count = rb.count;
     xSemaphoreGive(rb.mutex);
@@ -134,6 +166,8 @@ static size_t ring_buffer_get_count(void) {
 // ---------------------------------------------------------------------------
 // Variables Globales de Estado y UI
 // ---------------------------------------------------------------------------
+// Estas variables coordinan el flujo principal del sistema: comandos RS-232,
+// transmisión del log, activación de secuencia y temporización del LED.
 
 static volatile bool esperando_confirmacion = false;
 static volatile bool transmitiendo_archivo = false;
@@ -144,6 +178,8 @@ static volatile TickType_t inicio_parpadeo_secuencia = 0;
 // Mutex para evitar colisiones de lectura/escritura/borrado en el archivo
 static SemaphoreHandle_t file_mutex = NULL;
 
+// La máquina de estados interpreta cada trama recibida para separar campos,
+// ignorar ceros y Tare, y dejar la línea lista para almacenamiento.
 typedef enum {
   WAIT_CRLF_1,
   WAIT_COMMA_1,
@@ -165,6 +201,7 @@ static size_t line_idx = 0;
 static size_t pos_flag_tara = 0;
 static bool line_overflow = false;
 
+// Reinicia el buffer de línea para comenzar una nueva trama desde cero.
 static void reset_line_buffer(void) {
   line_idx = 0;
   pos_flag_tara = 0;
@@ -172,6 +209,15 @@ static void reset_line_buffer(void) {
   memset(line_buf, 0, sizeof(line_buf));
 }
 
+// Restablece el estado completo del parser para una nueva captura de datos.
+static void reset_capture_state(void) {
+  subestado_loop = WAIT_CRLF_1;
+  last_byte = 0x00;
+  linea = 0;
+  reset_line_buffer();
+}
+
+// Agrega un único carácter al buffer de línea si hay espacio disponible.
 static void append_char_to_line(char c) {
   if (line_idx < sizeof(line_buf) - 1) {
     line_buf[line_idx++] = c;
@@ -181,6 +227,7 @@ static void append_char_to_line(char c) {
   }
 }
 
+// Agrega una cadena al buffer de línea, marcando overflow si supera el tamaño.
 static void append_str_to_line(const char *str) {
   while (*str && (line_idx < sizeof(line_buf) - 1)) {
     line_buf[line_idx++] = *str++;
@@ -190,8 +237,7 @@ static void append_str_to_line(const char *str) {
     line_overflow = true;
 }
 
-// Detecta si la cadena de entrada contiene la cabecera de "Alert Technologies"
-// y devuelve true si se encuentra, false en caso contrario.
+// Detecta si la secuencia UART incluye la cabecera de identificación del equipo.
 static bool alerta_tecnologias_recibida(const char *stream) {
   if (stream == NULL)
     return false;
@@ -210,7 +256,12 @@ static bool alerta_tecnologias_recibida(const char *stream) {
 // ---------------------------------------------------------------------------
 // Procesador byte a byte
 // ---------------------------------------------------------------------------
+// Parsea la secuencia UART y reconstruye cada línea de datos antes de guardarla.
 static void procesar_loop_secuencia(uint8_t *buf, size_t len) {
+  if (buf == NULL || len == 0) {
+    return;
+  }
+
   TickType_t ahora = xTaskGetTickCount();
 
   if (!secuencia_activa) {
@@ -298,8 +349,11 @@ static void procesar_loop_secuencia(uint8_t *buf, size_t len) {
 
       // Depositar línea procesada en el Ring Buffer de RAM
       if (line_idx > 0) {
-        if (ring_buffer_write_all((uint8_t *)line_buf, line_idx))
+        if (ring_buffer_write_all((uint8_t *)line_buf, line_idx)) {
           ESP_LOGI(TAG, "Añadido a RAM Ring Buffer: %s", line_buf);
+        } else {
+          ESP_LOGW(TAG, "Línea descartada por falta de espacio en RAM: %s", line_buf);
+        }
       }
 
       subestado_loop = WAIT_CRLF_1;
@@ -321,6 +375,8 @@ static void procesar_loop_secuencia(uint8_t *buf, size_t len) {
 // ---------------------------------------------------------------------------
 // Tareas Secundarias (Flash Writer)
 // ---------------------------------------------------------------------------
+// Esta tarea asegura que el contenido acumulado en RAM se vuelque a la
+// partición LittleFS periódicamente o cuando supera el umbral definido.
 static void flash_writer_task(void *arg) {
   uint8_t *write_buf = (uint8_t *)malloc(TEMP_WRITE_BUF_SIZE);
   if (!write_buf) {
@@ -339,22 +395,34 @@ static void flash_writer_task(void *arg) {
     bool should_write = (pending_bytes >= FLASH_WRITE_THRESHOLD) || (pending_bytes > 0 && elapsed >= pdMS_TO_TICKS(5000));
 
     if (should_write && !transmitiendo_archivo) {
-      if (xSemaphoreTake(file_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+      if (file_mutex == NULL) {
+        ESP_LOGE(TAG_FLASH, "Mutex de archivo no inicializado.");
+      } else if (xSemaphoreTake(file_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
         FILE *f = fopen(log_path, "a+");
         if (f != NULL) {
           while (ring_buffer_get_count() > 0) {
             size_t bytes_to_read = ring_buffer_peek(write_buf, TEMP_WRITE_BUF_SIZE);
-            if (bytes_to_read > 0) {
-              size_t bytes_written = fwrite(write_buf, 1, bytes_to_read, f);
-              if (bytes_written != bytes_to_read) {
-                ESP_LOGE(TAG_FLASH, "Error escribiendo log: %u/%u bytes", (unsigned int)bytes_written, (unsigned int)bytes_to_read);
-                break;
-              }
-              ring_buffer_drop(bytes_written);
+            if (bytes_to_read == 0) {
+              break;
             }
+
+            size_t bytes_written = fwrite(write_buf, 1, bytes_to_read, f);
+            if (bytes_written != bytes_to_read) {
+              ESP_LOGE(TAG_FLASH, "Error escribiendo log: %u/%u bytes", (unsigned int)bytes_written, (unsigned int)bytes_to_read);
+              if (ferror(f)) {
+                ESP_LOGE(TAG_FLASH, "Error del flujo de archivo: %d", errno);
+              }
+              break;
+            }
+
+            ESP_LOGI(TAG_FLASH, "Grabado en flash (%u bytes): %.*s", (unsigned int)bytes_written, (int)bytes_written,
+                     (const char *)write_buf);
+            ring_buffer_drop(bytes_written);
           }
-          if (fflush(f) != 0 || ferror(f))
+
+          if (fflush(f) != 0 || ferror(f)) {
             ESP_LOGE(TAG_FLASH, "Error confirmando escritura del log.");
+          }
           fclose(f);
           ESP_LOGI(TAG_FLASH, "Volcado de RAM a Flash realizado correctamente.");
         } else {
@@ -372,6 +440,7 @@ static void flash_writer_task(void *arg) {
   vTaskDelete(NULL);
 }
 
+// Controla la señal visual del LED según la actividad y la pérdida de datos UART.
 static void secuencia_led_task(void *arg) {
   int estado_led = -1;
 
@@ -408,6 +477,7 @@ static void secuencia_led_task(void *arg) {
 // Tareas Principales
 // ---------------------------------------------------------------------------
 
+// Transmite el archivo de log almacenado en flash a través del puerto UART.
 static void tx_file_task(void *arg) {
   uint8_t *tx_buffer = (uint8_t *)malloc(UART_BUF_SIZE);
   if (tx_buffer == NULL) {
@@ -423,16 +493,22 @@ static void tx_file_task(void *arg) {
     ESP_LOGI(TAG, "Baudrate cambiado a 4800");
   }
 
-  if (xSemaphoreTake(file_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+  if (file_mutex == NULL) {
+    ESP_LOGE(TAG, "Mutex de archivo no inicializado para transmision.");
+  } else if (xSemaphoreTake(file_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
     FILE *f = fopen(log_path, "a+");
     if (f != NULL) {
       while (ring_buffer_get_count() > 0) {
         size_t bytes_to_write = ring_buffer_peek(tx_buffer, UART_BUF_SIZE);
         if (bytes_to_write == 0)
           break;
+
         size_t bytes_written = fwrite(tx_buffer, 1, bytes_to_write, f);
         if (bytes_written != bytes_to_write) {
           ESP_LOGE(TAG, "Error guardando datos pendientes antes de transmitir.");
+          if (ferror(f)) {
+            ESP_LOGE(TAG, "Error del flujo de archivo: %d", errno);
+          }
           break;
         }
         ring_buffer_drop(bytes_written);
@@ -469,9 +545,18 @@ static void tx_file_task(void *arg) {
   vTaskDelete(NULL);
 }
 
+// Recibe datos UART y coordina el parseo, comandos RS-232 y captura de tramas.
 static void rx_task(void *arg) {
   uint8_t *data = (uint8_t *)malloc(UART_BUF_SIZE);
   char *stream_buf = (char *)malloc(UART_BUF_SIZE + 64);
+
+  if (rb.mutex == NULL) {
+    ESP_LOGE(TAG, "Ring buffer no inicializado. Abortando rx_task.");
+    free(data);
+    free(stream_buf);
+    vTaskDelete(NULL);
+    return;
+  }
 
   if (data == NULL || stream_buf == NULL) {
     ESP_LOGE(TAG, "Error asignando memoria estática para rx_task");
@@ -495,10 +580,10 @@ static void rx_task(void *arg) {
     int rxBytes = uart_read_bytes(UART_PORT_NUM, data, UART_BUF_SIZE, pdMS_TO_TICKS(100));
 
     if (rxBytes > 0) {
-      ESP_LOG_BUFFER_HEXDUMP(TAG, data, rxBytes, ESP_LOG_WARN);
+      ESP_LOGD(TAG, "UART RX: %d bytes", rxBytes);
 
-      vTaskDelay(pdMS_TO_TICKS(50));
-
+      // flag que evita que se guarde o procese el contenido si se está atendiendo
+      // un comando del usuario o una transmisión de datos desde la memoria.
       bool ignorar_grabacion = false;
       size_t total_stream_len = overlap_len + rxBytes;
 
@@ -515,6 +600,8 @@ static void rx_task(void *arg) {
       }
 
       // 1. Manejo de Comandos RS-232
+      // Comprueba si el sistema está esperando una respuesta de confirmación
+      // para borrar RAM o ejecutar una operación controlada.
       if (esperando_confirmacion) {
         char resp = 0;
         for (int i = 0; i < rxBytes; i++) {
@@ -531,7 +618,7 @@ static void rx_task(void *arg) {
             if (f_clr != NULL) {
               fclose(f_clr);
               ring_buffer_clear();
-              reset_line_buffer();
+              reset_capture_state();
               uart_write_bytes(UART_PORT_NUM, "RAM test successful\r\n\r\nDone\r\n", 29);
             }
             xSemaphoreGive(file_mutex);
@@ -566,6 +653,8 @@ static void rx_task(void *arg) {
       }
 
       // 2. Procesamiento de Cabecera y Trama de Datos
+      // Busca la cabecera del protocolo y, si ya está activa la captura,
+      // parsea cada tramo de datos para reconstruir líneas útiles.
       if (!ignorar_grabacion && !transmitiendo_archivo) {
         if (estado_grabado == 0) {
           char *match = (char *)memmem(stream_buf, total_stream_len, target, target_len);
@@ -583,8 +672,7 @@ static void rx_task(void *arg) {
 
             ESP_LOGI(TAG, "Cabecera detectada. Iniciando captura de tramas...");
             estado_grabado = 2;
-            subestado_loop = WAIT_CRLF_1;
-            last_byte = 0x00;
+            reset_capture_state();
 
             // Procesar el resto del buffer inmediatamente en la máquina de estados
             if (rxBytes > data_match_end_idx) {
@@ -602,6 +690,8 @@ static void rx_task(void *arg) {
       }
 
       // 3. Mantenimiento del buffer de solapamiento
+      // Conserva un tramo final del flujo para detectar coincidencias partidas
+      // entre bloques UART consecutivos.
       if (!ignorar_grabacion && !transmitiendo_archivo) {
         if (total_stream_len >= (target_len - 1)) {
           overlap_len = target_len - 1;
@@ -628,6 +718,8 @@ static void rx_task(void *arg) {
 // ---------------------------------------------------------------------------
 // Entrada Principal (Main)
 // ---------------------------------------------------------------------------
+// Punto de entrada del firmware: crea los mutex, inicializa el hardware,
+// restaura el estado de captura y lanza las tareas del sistema.
 void app_main(void) {
   ESP_LOGI(TAG, "Inicializando Hardware y Estructuras de Memoria...");
 
@@ -643,6 +735,7 @@ void app_main(void) {
   }
 
   hardware_init_all();
+  reset_capture_state();
   ESP_LOGI(TAG, "Creando Interfaz de Usuario...");
 
   // Creación de tareas FreeRTOS
