@@ -10,7 +10,7 @@
 //#include "driver/spi_master.h"
 //#include "esp_lcd_panel_vendor.h"
 //#include "esp_lcd_panel_ops.h"
-#include "esp_lvgl_port.h"  // IWYU pragma: keep
+//#include "esp_lvgl_port.h"  // IWYU pragma: keep
 //#include "lvgl.h"
 
 
@@ -42,13 +42,9 @@ extern "C" {
 #define PIN_NUM_LCD_CS -1 
 #define PIN_NUM_BK_LIGHT  1
 
-extern lv_disp_t *lvgl_disp;
 
-
-void hardware_init_gpio(void);
 void hardware_init_uart(void);
 void hardware_init_all(void);
-lv_disp_t* hardware_init_display(void);
 void hardware_ws2812_set_color(uint8_t red, uint8_t green, uint8_t blue);
 
 

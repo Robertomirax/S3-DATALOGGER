@@ -17,6 +17,13 @@ Cuando empieza a leer y procesar el compactado de los valores de la celda de car
 se pone verde con parpadeo lento.
 Si deja de recibir datos desde la celda por mas de 30 segundos, pasa a parpadeo rojo rápido.
 -----------------------------------------------------------------------------------------------------
+-----------------------------------------------------------------------------------------------------
+version 29
+se eliminaron las rutinas del lvgl. Ahora no hay ningún display conectado solo el led WS2812B
+-----------------------------------------------------------------------------------------------------
+-----------------------------------------------------------------------------------------------------
+
+
 
 
 

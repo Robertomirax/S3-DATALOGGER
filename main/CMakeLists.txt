@@ -4,11 +4,9 @@ idf_component_register(
     INCLUDE_DIRS "."
     REQUIRES 
         freertos
-        esp_lcd 
         esp_driver_uart 
         esp_driver_gpio 
         esp_driver_spi 
         esp_driver_rmt
-        espressif__esp_lvgl_port
         driver
                 )

@@ -1,8 +1,7 @@
 //-------------------------------- main.c --------------------------------
-#include "driver/gpio.h"
+
 #include "driver/uart.h"
 #include "esp_log.h"
-#include "font/lv_font.h"
 #include "freertos/FreeRTOS.h" // IWYU pragma: keep
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -13,12 +12,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-
 // ---------------------------------------------------------------------------
 // Constantes y Definiciones
 // ---------------------------------------------------------------------------
 static const char *TAG = "MAIN_APP";
-static const char *TAG_KB = "TECLADO";
 static const char *TAG_FLASH = "FLASH_WRITER";
 static const char *log_path = "/archivos/log_uart.txt";
 
@@ -137,8 +134,6 @@ static size_t ring_buffer_get_count(void) {
 // ---------------------------------------------------------------------------
 // Variables Globales de Estado y UI
 // ---------------------------------------------------------------------------
-static lv_obj_t *lbl_status = NULL;
-static lv_obj_t *bar_status = NULL;
 
 static volatile bool esperando_confirmacion = false;
 static volatile bool transmitiendo_archivo = false;
@@ -198,18 +193,18 @@ static void append_str_to_line(const char *str) {
 // Detecta si la cadena de entrada contiene la cabecera de "Alert Technologies"
 // y devuelve true si se encuentra, false en caso contrario.
 static bool alerta_tecnologias_recibida(const char *stream) {
-    if (stream == NULL)
-        return false;
+  if (stream == NULL)
+    return false;
 
-    const char *header = "Alert Technologies, Model ";
-    const char *model_start = strstr(stream, header);
-    if (model_start == NULL)
-        return false;
+  const char *header = "Alert Technologies, Model ";
+  const char *model_start = strstr(stream, header);
+  if (model_start == NULL)
+    return false;
 
-    // Busca ", Version " a partir de donde termina el encabezado del modelo
-    const char *version_start = strstr(model_start + strlen(header), ", Version ");
-    
-    return version_start != NULL;
+  // Busca ", Version " a partir de donde termina el encabezado del modelo
+  const char *version_start = strstr(model_start + strlen(header), ", Version ");
+
+  return version_start != NULL;
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +220,7 @@ static void procesar_loop_secuencia(uint8_t *buf, size_t len) {
     ESP_LOGI(TAG, "Primera entrada en la secuencia. LED verde encendido.");
   }
   ultima_recepcion_secuencia = ahora;
-  
+
   for (size_t i = 0; i < len; i++) {
     uint8_t b = buf[i];
 
@@ -324,7 +319,7 @@ static void procesar_loop_secuencia(uint8_t *buf, size_t len) {
 }
 
 // ---------------------------------------------------------------------------
-// Tareas Secundarias (Flash Writer & UI Monitor)
+// Tareas Secundarias (Flash Writer)
 // ---------------------------------------------------------------------------
 static void flash_writer_task(void *arg) {
   uint8_t *write_buf = (uint8_t *)malloc(TEMP_WRITE_BUF_SIZE);
@@ -377,40 +372,6 @@ static void flash_writer_task(void *arg) {
   vTaskDelete(NULL);
 }
 
-static void ui_update_task(void *arg) {
-  char buf[64];
-
-  while (1) {
-    size_t pending_bytes = ring_buffer_get_count();
-    uint32_t percentage = (pending_bytes * 100) / RING_BUF_SIZE;
-
-    if (lvgl_port_lock(portMAX_DELAY)) {
-      // Actualización de texto explicativo
-      if (lbl_status != NULL) {
-        snprintf(buf, sizeof(buf), "RAM Buffer: %u / %d B (%u%%)", (unsigned int)pending_bytes, RING_BUF_SIZE, (unsigned int)percentage);
-        lv_label_set_text(lbl_status, buf);
-      }
-
-      // Actualización gráfica de la barra de progreso
-      if (bar_status != NULL) {
-        if (percentage > 80) {
-          lv_obj_set_style_bg_color(bar_status, lv_palette_main(LV_PALETTE_RED), LV_PART_INDICATOR);
-        } else {
-          lv_obj_set_style_bg_color(bar_status, lv_palette_main(LV_PALETTE_GREEN), LV_PART_INDICATOR);
-        }
-
-        lv_bar_set_value(bar_status, percentage, LV_ANIM_ON);
-      }
-
-      lvgl_port_unlock();
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(200));
-  }
-
-  vTaskDelete(NULL);
-}
-
 static void secuencia_led_task(void *arg) {
   int estado_led = -1;
 
@@ -446,79 +407,6 @@ static void secuencia_led_task(void *arg) {
 // ---------------------------------------------------------------------------
 // Tareas Principales
 // ---------------------------------------------------------------------------
-void console_keyboard_task(void *arg) {
-  ESP_LOGI(TAG_KB, "Monitoreo de teclado iniciado.");
-
-  while (1) {
-    int c = getchar();
-
-    if (c == 'B') {
-      printf("\r\n[ALERTA] Solicitud de borrado.\r\nWill clear data\r\nAre you sure? y/n \r\n");
-      fflush(stdout);
-
-      bool esperando = true;
-      while (esperando) {
-        int resp = getchar();
-        if (resp != EOF && resp != '\r' && resp != '\n') {
-          if (resp == 'y' || resp == 'Y') {
-            printf("\r\nSelf Diag ...Waiting\r\n");
-
-            if (xSemaphoreTake(file_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
-              FILE *f = fopen(log_path, "w");
-              if (f != NULL) {
-                fclose(f);
-                ring_buffer_clear();
-                reset_line_buffer();
-                ESP_LOGI(TAG_KB, "Archivo borrado.");
-                printf("RAM test successful\r\n\r\nDone\r\n");
-              } else {
-                ESP_LOGE(TAG_KB, "Fallo al borrar.");
-              }
-              xSemaphoreGive(file_mutex);
-            }
-          } else {
-            ESP_LOGI(TAG_KB, "Operacion cancelada.");
-          }
-          esperando = false;
-        }
-        vTaskDelay(pdMS_TO_TICKS(20));
-      }
-    }
-    if (c == 'e') {
-      gpio_set_level(PIN_NUM_BK_LIGHT, 1); // Enciende display
-    }
-    if (c == 'a') {
-      gpio_set_level(PIN_NUM_BK_LIGHT, 0); // Apaga display
-    }
-
-    if (c == 'r') {
-      hardware_ws2812_set_color(255, 0, 0);
-      ESP_LOGI("LED", "rojo");
-    }
-
-    if (c == 'g') {
-      hardware_ws2812_set_color(0, 255, 0);
-      ESP_LOGI("LED", "verde");
-    }
-
-    if (c == 'b') {
-      hardware_ws2812_set_color(0, 0, 255);
-      ESP_LOGI("LED", "azul");
-    }
-
-    if (c == 'n') {
-      hardware_ws2812_set_color(0, 0, 0);
-      ESP_LOGI("LED", "apagado");
-    }
-
-    if (c == 'w') {
-      hardware_ws2812_set_color(255, 255, 255);
-      ESP_LOGI("LED", "blanco");
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(50));
-  }
-}
 
 static void tx_file_task(void *arg) {
   uint8_t *tx_buffer = (uint8_t *)malloc(UART_BUF_SIZE);
@@ -608,7 +496,7 @@ static void rx_task(void *arg) {
 
     if (rxBytes > 0) {
       ESP_LOG_BUFFER_HEXDUMP(TAG, data, rxBytes, ESP_LOG_WARN);
-    
+
       vTaskDelay(pdMS_TO_TICKS(50));
 
       bool ignorar_grabacion = false;
@@ -692,7 +580,7 @@ static void rx_task(void *arg) {
               ESP_LOGE(TAG, "Cabecera descartada parcialmente por falta de espacio en RAM.");
 
             // Transición a la captura continua de tramas
-           
+
             ESP_LOGI(TAG, "Cabecera detectada. Iniciando captura de tramas...");
             estado_grabado = 2;
             subestado_loop = WAIT_CRLF_1;
@@ -730,51 +618,11 @@ static void rx_task(void *arg) {
         }
       }
     }
-    
   }
 
   free(data);
   free(stream_buf);
   vTaskDelete(NULL);
-}
-
-// ---------------------------------------------------------------------------
-// Interfaz de Usuario LVGL
-// ---------------------------------------------------------------------------
-void create_ui(void) {
-  if (lvgl_port_lock(portMAX_DELAY)) {
-    lv_obj_t *scr = lv_disp_get_scr_act(lvgl_disp);
-    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
-
-    // Título Superior
-    lv_obj_t *lbl_title = lv_label_create(scr);
-    lv_label_set_text(lbl_title, "DATALOGGER");
-    lv_obj_set_style_text_color(lbl_title, lv_palette_main(LV_PALETTE_YELLOW), 0);
-    lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_30, 0);
-    lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, 0, 15);
-
-    // Etiqueta de Estado de RAM
-    lbl_status = lv_label_create(scr);
-    lv_label_set_text(lbl_status, "Iniciando...");
-    lv_obj_set_style_text_color(lbl_status, lv_palette_main(LV_PALETTE_CYAN), 0);
-    lv_obj_set_width(lbl_status, 220);
-    lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_30, 0);
-    lv_label_set_long_mode(lbl_status, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(lbl_status, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(lbl_status, LV_ALIGN_CENTER, 0, -10);
-
-    // Widget Barra de Progreso (lv_bar)
-    bar_status = lv_bar_create(scr);
-    lv_obj_set_size(bar_status, 200, 15);
-    lv_obj_align(bar_status, LV_ALIGN_CENTER, 0, 30);
-    lv_bar_set_range(bar_status, 0, 100);
-    lv_bar_set_value(bar_status, 0, LV_ANIM_OFF);
-
-    lv_obj_set_style_bg_color(bar_status, lv_palette_darken(LV_PALETTE_GREY, 3), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(bar_status, lv_palette_main(LV_PALETTE_GREEN), LV_PART_INDICATOR);
-
-    lvgl_port_unlock();
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -796,23 +644,15 @@ void app_main(void) {
 
   hardware_init_all();
   ESP_LOGI(TAG, "Creando Interfaz de Usuario...");
-  create_ui();
-
-  // vTaskDelay(pdMS_TO_TICKS(100));
 
   // Creación de tareas FreeRTOS
   if (xTaskCreate(rx_task, "uart_rx_task", 4096, NULL, 5, NULL) != pdPASS ||
       xTaskCreate(flash_writer_task, "flash_writer_task", 4096, NULL, 4, NULL) != pdPASS ||
-      xTaskCreate(ui_update_task, "ui_update_task", 2048, NULL, 3, NULL) != pdPASS ||
-      xTaskCreate(secuencia_led_task, "secuencia_led_task", 2048, NULL, 3, NULL) != pdPASS ||
-      xTaskCreate(console_keyboard_task, "console_keyboard_task", 2048, NULL, 5, NULL) != pdPASS) {
+      xTaskCreate(secuencia_led_task, "secuencia_led_task", 2048, NULL, 3, NULL) != pdPASS) {
     ESP_LOGE(TAG, "No se pudieron crear todas las tareas del sistema.");
     return;
   }
 
-  // vTaskDelay(pdMS_TO_TICKS(100));
-  // uart_write_bytes(UART_PORT_NUM, DL_HEADER1, strlen(DL_HEADER1));
-  // vTaskDelay(pdMS_TO_TICKS(50));
   uart_write_bytes(UART_PORT_NUM, DL_HEADER2, strlen(DL_HEADER2));
 
   vTaskDelete(NULL);
