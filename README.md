@@ -11,6 +11,8 @@ Proyecto basado en ESP-IDF para capturar, guardar y retransmitir datos UART prov
 - vuelca a la partición LittleFS
 - puede retransmitir el log por UART
 - usa un LED WS2812B para indicar estado visual
+- mide el voltaje de la batería mediante el ADC
+- informa el voltaje de la batería en el monitor serie cada 5 segundos
 
 ## Requisitos
 
@@ -50,10 +52,22 @@ idf.py -p COM15 monitor
 
 ## Funcionamiento esperado
 
-- LED rojo fijo: sistema esperando la llegada de la cabecera de la celda
+- LED magenta: sistema esperando la primera trama de la celda
 - LED azul: cabecera del equipo detectada
 - LED verde parpadeando lento: captura activa y parseo de secuencia
-- LEC rojo parapadeando rápido: No están llegando datos de la celda
+- LED magenta parpadeando rápido: no están llegando datos de la celda durante más de 30 s
+- Destello amarillo corto cada 5 s: batería entre 3.8 V y 4.0 V
+- Destello rojo corto cada 5 s: batería por debajo de 3.8 V
+
+## Medición de batería
+
+- Entrada ADC: `GPIO5` (`ADC1_CH4` en ESP32-S3)
+- Relación configurada del divisor resistivo: `2.03`
+- La lectura se calibra con el ADC del ESP-IDF cuando hay calibración disponible
+- El valor se muestra en el monitor serie en milivoltios y voltios
+- Los destellos de alarma duran aproximadamente 100 ms y después se restaura el estado anterior del LED
+
+La relación del divisor debe coincidir con el circuito instalado. Se configura en `BAT_VOLTAGE_DIVIDER_RATIO` dentro de [main/hardware.h](main/hardware.h).
 
 ## Archivos importantes
 
@@ -80,6 +94,9 @@ El LED cambia según estado de la celda:
 
 ### Versión 29
 Se eliminaron las rutinas de LVGL. Ahora solo se usa el LED WS2812B y se mantiene el almacenamiento en LittleFS.
+
+### Versión 30
+Se añadió la medición de batería por ADC en GPIO5. El voltaje se registra cada 5 segundos y activa un destello amarillo entre 3.8 V y 4.0 V, o rojo por debajo de 3.8 V.
 
 
 

@@ -7,15 +7,6 @@
 
 #include <stdint.h>
 
-//#include "driver/gpio.h"
-//#include "driver/uart.h"
-//#include "driver/spi_master.h"
-//#include "esp_lcd_panel_vendor.h"
-//#include "esp_lcd_panel_ops.h"
-//#include "esp_lvgl_port.h"  // IWYU pragma: keep
-//#include "lvgl.h"
-
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -29,9 +20,15 @@ extern "C" {
 #define BAUD_RATE 300
 
 // --- OTROS PINES ---
-// GPIO del LED de estado y GPIO del LED RGB WS2812.
-#define BLINK_GPIO GPIO_NUM_8
+// GPIO del LED RGB WS2812.
 #define WS2812_GPIO GPIO_NUM_48
+#define BAT_VOLTAGE_ADC_PIN GPIO_NUM_5 // ADC1_CH4
+#define BAT_VOLTAGE_DIVIDER_RATIO 2.03f // Ajustar al divisor resistivo usado
+#define BATTERY_LOW_AMARILLO_MV 4000 // Umbral de batería baja nivel amarillo en mV
+#define BATTERY_LOW_ROJO_MV 3800 // Umbral de batería baja nivel rojo en mV
+#define LED_COLOR_MAGENTA 255, 0, 255 // Color magenta para indicar inicio esperando primera trama de la celda de carga
+#define LED_COLOR_VERDE 0, 255, 0 // Color verde para indicar recepción de datos
+#define LED_COLOR_ROJO 255, 0, 0 // Color rojo para indicar error o falta de datos
 
 // Pines y resolución previstos para un display ST7789 si se reactivara.
 #define LCD_HOST SPI2_HOST
@@ -49,11 +46,20 @@ extern "C" {
 // Inicializa el hardware UART del sistema.
 void hardware_init_uart(void);
 
+// Inicializa el ADC usado para medir la batería.
+void hardware_init_battery_adc(void);
+
+// Lee la tensión de batería en milivoltios.
+int hardware_read_battery_voltage_mv(void);
+
 // Inicializa la capa de almacenamiento y el resto de periféricos conectados.
 void hardware_init_all(void);
 
 // Envía un color RGB al LED WS2812 mediante RMT.
 void hardware_ws2812_set_color(uint8_t red, uint8_t green, uint8_t blue);
+
+// Muestra un color brevemente y restaura el color anterior.
+void hardware_ws2812_flash_color(uint8_t red, uint8_t green, uint8_t blue, uint32_t duration_ms);
 
 
 #ifdef __cplusplus

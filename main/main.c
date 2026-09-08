@@ -456,9 +456,9 @@ static void secuencia_led_task(void *arg) {
 
       if (nuevo_estado != estado_led) {
         if (nuevo_estado == 2) {
-          hardware_ws2812_set_color(255, 0, 0);
+          hardware_ws2812_set_color(LED_COLOR_MAGENTA);
         } else if (nuevo_estado == 1) {
-          hardware_ws2812_set_color(0, 255, 0);
+          hardware_ws2812_set_color(LED_COLOR_VERDE);
         } else {
           hardware_ws2812_set_color(0, 0, 0);
         }
@@ -476,6 +476,26 @@ static void secuencia_led_task(void *arg) {
 // ---------------------------------------------------------------------------
 // Tareas Principales
 // ---------------------------------------------------------------------------
+
+// Mide la batería y deja el valor en la terminal de depuración cada 10 segundos.
+static void battery_voltage_task(void *arg) {
+  while (1) {
+    int battery_voltage_mv = hardware_read_battery_voltage_mv();
+    if (battery_voltage_mv >= 0) {
+      ESP_LOGI(TAG, "Voltaje de bateria: %d mV (%.2f V)", battery_voltage_mv, battery_voltage_mv / 1000.0f);
+      if (battery_voltage_mv < BATTERY_LOW_AMARILLO_MV && battery_voltage_mv >= BATTERY_LOW_ROJO_MV) {
+        hardware_ws2812_flash_color(255, 180, 0, 100);
+        ESP_LOGW(TAG, "Bateria baja: destello amarillo");
+      }else if (battery_voltage_mv < BATTERY_LOW_ROJO_MV) {
+        hardware_ws2812_flash_color(255, 0, 0, 100);
+        ESP_LOGW(TAG, "Bateria muy baja: destello rojo");
+      }
+    } else {
+      ESP_LOGE(TAG, "No se pudo leer el voltaje de bateria");
+    }
+    vTaskDelay(pdMS_TO_TICKS(5000));
+  }
+}
 
 // Transmite el archivo de log almacenado en flash a través del puerto UART.
 static void tx_file_task(void *arg) {
@@ -741,7 +761,8 @@ void app_main(void) {
   // Creación de tareas FreeRTOS
   if (xTaskCreate(rx_task, "uart_rx_task", 4096, NULL, 5, NULL) != pdPASS ||
       xTaskCreate(flash_writer_task, "flash_writer_task", 4096, NULL, 4, NULL) != pdPASS ||
-      xTaskCreate(secuencia_led_task, "secuencia_led_task", 2048, NULL, 3, NULL) != pdPASS) {
+      xTaskCreate(secuencia_led_task, "secuencia_led_task", 2048, NULL, 3, NULL) != pdPASS ||
+      xTaskCreate(battery_voltage_task, "battery_voltage_task", 2048, NULL, 3, NULL) != pdPASS) {
     ESP_LOGE(TAG, "No se pudieron crear todas las tareas del sistema.");
     return;
   }
