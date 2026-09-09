@@ -5,9 +5,15 @@ idf_component_register(
     REQUIRES 
         freertos
         esp_driver_uart 
+        esp_driver_i2c
         esp_driver_gpio 
         esp_driver_spi 
         esp_driver_rmt
         esp_adc
+        esp_lcd
         driver
-                )
+        fatfs
+        wear_levelling
+        esp_partition
+        esp_tinyusb
+            )

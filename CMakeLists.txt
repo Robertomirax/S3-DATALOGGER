@@ -5,5 +5,5 @@ cmake_minimum_required(VERSION 3.22)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(S3-DATALOGGER)
 
-# Crear imagen SPIFFS desde carpeta "archivos"
-littlefs_create_partition_image(archivos archivos FLASH_IN_PROJECT)
+# Crear imagen FAT con metadatos de wear leveling desde carpeta "archivos"
+ fatfs_create_spiflash_image(archivos archivos FLASH_IN_PROJECT)

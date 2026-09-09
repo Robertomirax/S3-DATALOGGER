@@ -1,11 +1,14 @@
 //----------------------------   hardware.h ----------------
 // Definiciones de pines, buffers y funciones de control del hardware del
-// datalogger. Este archivo centraliza la configuración del UART y del LED RGB.
+// datalogger. Este archivo centraliza la configuración del UART y del OLED.
 
 #ifndef HARDWARE_H
 #define HARDWARE_H
 
+#include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
+#include "esp_err.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,28 +23,13 @@ extern "C" {
 #define BAUD_RATE 300
 
 // --- OTROS PINES ---
-// GPIO del LED RGB WS2812.
-#define WS2812_GPIO GPIO_NUM_48
 #define BAT_VOLTAGE_ADC_PIN GPIO_NUM_5 // ADC1_CH4
 #define BAT_VOLTAGE_DIVIDER_RATIO 2.03f // Ajustar al divisor resistivo usado
 #define BATTERY_LOW_AMARILLO_MV 4000 // Umbral de batería baja nivel amarillo en mV
 #define BATTERY_LOW_ROJO_MV 3800 // Umbral de batería baja nivel rojo en mV
-#define LED_COLOR_MAGENTA 255, 0, 255 // Color magenta para indicar inicio esperando primera trama de la celda de carga
-#define LED_COLOR_VERDE 0, 255, 0 // Color verde para indicar recepción de datos
-#define LED_COLOR_ROJO 255, 0, 0 // Color rojo para indicar error o falta de datos
-
-// Pines y resolución previstos para un display ST7789 si se reactivara.
-#define LCD_HOST SPI2_HOST
-#define LCD_H_RES 240
-#define LCD_V_RES 240
-
-#define PIN_NUM_SCLK 12
-#define PIN_NUM_MOSI 11
-#define PIN_NUM_MISO -1
-#define PIN_NUM_LCD_DC 2
-#define PIN_NUM_LCD_RST 4
-#define PIN_NUM_LCD_CS -1
-#define PIN_NUM_BK_LIGHT 1
+#define OLED_I2C_SDA_GPIO GPIO_NUM_11
+#define OLED_I2C_SCL_GPIO GPIO_NUM_12
+#define OLED_I2C_ADDRESS 0x3C
 
 // Inicializa el hardware UART del sistema.
 void hardware_init_uart(void);
@@ -52,14 +40,41 @@ void hardware_init_battery_adc(void);
 // Lee la tensión de batería en milivoltios.
 int hardware_read_battery_voltage_mv(void);
 
+// Inicializa el OLED SSD1306 conectado por I2C.
+void hardware_init_oled(void);
+
+// Actualiza el voltaje de batería mostrado en la primera línea del OLED.
+void hardware_oled_show_battery(int voltage_mv);
+
+// Oculta la línea de batería del OLED cuando el equipo está en modo USB.
+void hardware_oled_hide_battery(void);
+
+// Muestra un estado o aviso en el OLED.
+void hardware_oled_show_message(const char *title, const char *message);
+
+// Actualiza el porcentaje de tara mostrado en la segunda línea.
+void hardware_oled_show_tara(float tara_percent);
+
+// Muestra el contenido de la última trama recibida debajo de la batería.
+void hardware_oled_show_frame(const char *frame);
+
+// Muestra los últimos caracteres recibidos por UART en la última línea.
+void hardware_oled_update_uart_preview(const uint8_t *data, size_t len);
+
+// Oculta la vista previa UART cuando comienza la captura de tramas.
+void hardware_oled_clear_uart_preview(void);
+
+// Muestra en el OLED los datos originales recibidos durante el loop.
+void hardware_oled_update_loop_preview(const uint8_t *data, size_t len);
+
 // Inicializa la capa de almacenamiento y el resto de periféricos conectados.
 void hardware_init_all(void);
 
-// Envía un color RGB al LED WS2812 mediante RMT.
-void hardware_ws2812_set_color(uint8_t red, uint8_t green, uint8_t blue);
+// Indica si el almacenamiento está reservado para el host USB como pendrive.
+bool hardware_usb_msc_active(void);
 
-// Muestra un color brevemente y restaura el color anterior.
-void hardware_ws2812_flash_color(uint8_t red, uint8_t green, uint8_t blue, uint32_t duration_ms);
+// Cede la particion FAT al host USB sin reiniciar ni reflashear el equipo.
+esp_err_t hardware_enter_usb_msc(void);
 
 
 #ifdef __cplusplus
