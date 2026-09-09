@@ -68,7 +68,7 @@ sistema de archivos.
 
 En este modo no se muestra ni se actualiza el voltaje de batería en el OLED.
 
-Para volver a registrar, desconecta el USB y reinicia el equipo.
+Para volver a registrar, desconecta el USB y conecta la celda de carga.
 
 La primera vez que se prepara una partición FAT nueva hay que flashear el firmware
 y la imagen de datos:
