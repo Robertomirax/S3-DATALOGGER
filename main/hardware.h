@@ -5,14 +5,17 @@
 #ifndef HARDWARE_H
 #define HARDWARE_H
 
+#include "esp_err.h"
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdbool.h>
-#include "esp_err.h"
+
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#define FIRM 36 // Version del firmware
 
 // --- CONFIGURACIÓN UART / MAX3232 ---
 // El puerto UART_1 se usa para la comunicación con la celda de carga.
@@ -23,10 +26,10 @@ extern "C" {
 #define BAUD_RATE 300
 
 // --- OTROS PINES ---
-#define BAT_VOLTAGE_ADC_PIN GPIO_NUM_5 // ADC1_CH4
+#define BAT_VOLTAGE_ADC_PIN GPIO_NUM_5  // ADC1_CH4
 #define BAT_VOLTAGE_DIVIDER_RATIO 2.03f // Ajustar al divisor resistivo usado
-#define BATTERY_LOW_AMARILLO_MV 4000 // Umbral de batería baja nivel amarillo en mV
-#define BATTERY_LOW_ROJO_MV 3800 // Umbral de batería baja nivel rojo en mV
+#define BATTERY_LOW_AMARILLO_MV 4000    // Umbral de batería baja nivel amarillo en mV
+#define BATTERY_LOW_ROJO_MV 3800        // Umbral de batería baja nivel rojo en mV
 #define OLED_I2C_SDA_GPIO GPIO_NUM_11
 #define OLED_I2C_SCL_GPIO GPIO_NUM_12
 #define OLED_I2C_ADDRESS 0x3C
@@ -73,9 +76,14 @@ void hardware_init_all(void);
 // Indica si el almacenamiento está reservado para el host USB como pendrive.
 bool hardware_usb_msc_active(void);
 
+// Indica que el host USB se desconecto fisicamente del pendrive.
+bool hardware_usb_msc_detached(void);
+
 // Cede la particion FAT al host USB sin reiniciar ni reflashear el equipo.
 esp_err_t hardware_enter_usb_msc(void);
 
+// Detiene MSC y devuelve la particion FAT a la aplicacion.
+esp_err_t hardware_exit_usb_msc(void);
 
 #ifdef __cplusplus
 }

@@ -1,5 +1,7 @@
 # Name,   Type, SubType, Offset,  Size, Flags
 nvs,data,nvs,0x9000,0x7000,
-factory,app,factory,0x10000,0xE18000,
-phy,data,phy,0xE28000,0x1000,
-archivos,data,fat,0xE29000,0x1D7000,
+otadata,data,ota,0x10000,0x2000,
+ota_0,app,ota_0,0x20000,0x700000,
+ota_1,app,ota_1,0x720000,0x700000,
+phy,data,phy,0xE20000,0x1000,
+archivos,data,fat,0xE21000,0x1DF000,

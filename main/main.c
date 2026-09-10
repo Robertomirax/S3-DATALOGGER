@@ -1,6 +1,7 @@
 //-------------------------------- main.c --------------------------------
 
 #include "driver/uart.h"
+#include "esp_ota_ops.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h" // IWYU pragma: keep
 #include "freertos/semphr.h"
@@ -20,6 +21,7 @@
 static const char *TAG = "MAIN_APP";
 static const char *TAG_FLASH = "FLASH_WRITER";
 static const char *log_path = "/archivos/log_uart.txt";
+static const char *update_path = "/archivos/firmware.bin";
 
 // static const char DL_HEADER1[] = "\x55\x55\x55\x55\x55\x55\x55";
 static const char DL_HEADER2[] = "\r\n\r\nAlert Technologies\r\nDATALOGGER "
@@ -518,6 +520,100 @@ static bool flush_pending_log(void) {
   return success;
 }
 
+static bool install_firmware_update(void) {
+  FILE *file = fopen(update_path, "rb");
+  if (file == NULL) {
+    ESP_LOGI(TAG, "No hay actualizacion en %s", update_path);
+    return false;
+  }
+
+  const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+  if (update_partition == NULL) {
+    const esp_partition_t *running_partition = esp_ota_get_running_partition();
+    ESP_LOGE(TAG, "No hay particion OTA disponible; firmware activo: %s",
+             running_partition != NULL ? running_partition->label : "desconocido");
+    ESP_LOGE(TAG, "Debe reflashearse la tabla de particiones OTA con 'idf.py flash'");
+    fclose(file);
+    return false;
+  }
+
+  uint8_t *buffer = (uint8_t *)malloc(4096);
+  if (buffer == NULL) {
+    ESP_LOGE(TAG, "No se pudo reservar el buffer para la actualizacion OTA");
+    fclose(file);
+    return false;
+  }
+
+  esp_ota_handle_t ota_handle = 0;
+  esp_err_t error = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &ota_handle);
+  if (error != ESP_OK) {
+    ESP_LOGE(TAG, "No se pudo iniciar OTA: %s", esp_err_to_name(error));
+    free(buffer);
+    fclose(file);
+    return false;
+  }
+
+  bool success = true;
+  size_t bytes_read;
+  while ((bytes_read = fread(buffer, 1, 4096, file)) > 0) {
+    error = esp_ota_write(ota_handle, buffer, bytes_read);
+    if (error != ESP_OK) {
+      ESP_LOGE(TAG, "Error escribiendo firmware OTA: %s", esp_err_to_name(error));
+      success = false;
+      break;
+    }
+  }
+  if (ferror(file)) {
+    ESP_LOGE(TAG, "Error leyendo %s", update_path);
+    success = false;
+  }
+  fclose(file);
+
+  if (success) {
+    error = esp_ota_end(ota_handle);
+    if (error == ESP_OK) {
+      error = esp_ota_set_boot_partition(update_partition);
+    }
+    if (error != ESP_OK) {
+      ESP_LOGE(TAG, "Firmware OTA no valido: %s", esp_err_to_name(error));
+      success = false;
+    }
+  } else {
+    esp_ota_abort(ota_handle);
+  }
+
+  free(buffer);
+
+  if (success) {
+    if (remove(update_path) != 0) {
+      ESP_LOGW(TAG, "No se pudo borrar %s tras la actualizacion", update_path);
+    }
+    ESP_LOGI(TAG, "Actualizacion instalada en %s; reiniciando", update_partition->label);
+  }
+  return success;
+}
+
+static void usb_update_task(void *arg) {
+  (void)arg;
+
+  while (!hardware_usb_msc_detached()) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+
+  vTaskDelay(pdMS_TO_TICKS(1000));
+  ESP_LOGI(TAG, "USB desconectado; recuperando la FAT para buscar firmware");
+  if (hardware_exit_usb_msc() == ESP_OK) {
+    modo_usb = false;
+    hardware_oled_show_message("OTA", "VERIFICANDO");
+    if (install_firmware_update()) {
+      esp_restart();
+    }
+  }
+
+  ESP_LOGI(TAG, "Sin actualizacion valida; reiniciando en modo logger");
+  esp_restart();
+}
+
 static void startup_mode_task(void *arg) {
   (void)arg;
   vTaskDelay(pdMS_TO_TICKS(5000));
@@ -529,12 +625,16 @@ static void startup_mode_task(void *arg) {
 
   ESP_LOGW(TAG, "No se recibio la cabecera en 5 segundos; cambiando a USB");
   transmitiendo_archivo = true;
+  modo_usb = true;
   if (flush_pending_log() && hardware_enter_usb_msc() == ESP_OK) {
-    modo_usb = true;
     hardware_oled_hide_battery();
     hardware_oled_show_message("USB", "CONECTE USB");
     ESP_LOGI(TAG, "Modo USB activo; el logger dejo de acceder a la FAT");
+    if (xTaskCreate(usb_update_task, "usb_update_task", 4096, NULL, 4, NULL) != pdPASS) {
+      ESP_LOGE(TAG, "No se pudo crear la tarea de actualizacion USB");
+    }
   } else {
+    modo_usb = false;
     transmitiendo_archivo = false;
     ESP_LOGE(TAG, "No se pudo cambiar automaticamente al modo USB");
   }
@@ -916,6 +1016,10 @@ void app_main(void) {
   if (!ensure_log_file() || !ensure_root_readme()) {
     ESP_LOGE(TAG, "Almacenamiento no disponible; no se iniciaran las tareas del datalogger");
     return;
+  }
+
+  if (install_firmware_update()) {
+    esp_restart();
   }
 
   // Creación de tareas FreeRTOS

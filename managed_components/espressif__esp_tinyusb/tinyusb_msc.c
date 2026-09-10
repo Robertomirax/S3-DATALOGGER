@@ -294,39 +294,6 @@ static inline esp_err_t msc_storage_write_sector(uint8_t lun, uint32_t lba, uint
 }
 
 /**
- * @brief Handles deferred USB MSC write operations.
- *
- * This function is invoked via TinyUSB's deferred execution mechanism to perform
- * write operations to the underlying storage. It writes data from the
- * `storage_buffer` stored within the `s_storage_handle`.
- *
- * @param param Pointer to the storage object containing the write parameters.
- */
-static void tusb_write_func(void *param)
-{
-    assert(param); // Ensure storage is not NULL
-    msc_storage_obj_t *storage = (msc_storage_obj_t *)param;
-
-    esp_err_t err = msc_storage_write_sector(
-                        storage->storage_buffer.lun,
-                        storage->storage_buffer.lba,
-                        storage->storage_buffer.offset,
-                        storage->storage_buffer.bufsize,
-                        (const void *)storage->storage_buffer.data_buffer
-                    );
-
-    // Decrement the deferred writes counter
-    MSC_ENTER_CRITICAL();
-    assert(storage->deffered_writes > 0); // Ensure there are deferred writes pending
-    storage->deffered_writes--;
-    MSC_EXIT_CRITICAL();
-
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Write failed, error=0x%x", err);
-    }
-}
-
-/**
  * @brief Write a sector to the storage medium using deferred execution.
  *
  * This function copies the data to be written into an internal buffer and
@@ -345,43 +312,7 @@ static void tusb_write_func(void *param)
  */
 static inline esp_err_t msc_storage_write_sector_deferred(uint8_t lun, uint32_t lba, uint32_t offset, size_t size, const void *src)
 {
-    msc_storage_obj_t *storage = NULL;
-
-    MSC_ENTER_CRITICAL();
-    bool found = _msc_storage_get_by_lun(lun, &storage);
-    MSC_EXIT_CRITICAL();
-
-    if (!found || storage == NULL) {
-        ESP_LOGE(TAG, "LUN %d is not mapped to any storage", lun);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    // As we defer the write operation to the TinyUSB task, we need to ensure that
-    // the address does not overflow for SPI Flash storage medium
-    if (storage->medium->type == STORAGE_MEDIUM_TYPE_SPIFLASH) {
-        size_t addr = 0; // Address of the data to be read, relative to the beginning of the partition.
-        size_t temp = 0;
-        size_t sector_size = storage->sector_size;
-        ESP_RETURN_ON_FALSE(!__builtin_umul_overflow(lba, sector_size, &temp), ESP_ERR_INVALID_SIZE, TAG, "overflow lba %lu sector_size %u", lba, sector_size);
-        ESP_RETURN_ON_FALSE(!__builtin_uadd_overflow(temp, offset, &addr), ESP_ERR_INVALID_SIZE, TAG, "overflow addr %u offset %lu", temp, offset);
-    }
-
-    // Copy data to the buffer
-    memcpy((void *)storage->storage_buffer.data_buffer, src, size);
-    storage->storage_buffer.lun = lun;
-    storage->storage_buffer.lba = lba;
-    storage->storage_buffer.offset = offset;
-    storage->storage_buffer.bufsize = size;
-
-    // Increment the deferred writes counter
-    MSC_ENTER_CRITICAL();
-    storage->deffered_writes++;
-    MSC_EXIT_CRITICAL();
-
-    // Defer execution of the write to the TinyUSB task
-    usbd_defer_func(tusb_write_func, (void *)storage, false);
-
-    return ESP_OK;
+    return msc_storage_write_sector(lun, lba, offset, size, src);
 }
 
 static esp_err_t vfs_fat_format(BYTE format_flags)
@@ -449,7 +380,7 @@ static esp_err_t vfs_fat_mount(char *drv, FATFS *fs, bool force)
  *
  * @return
  *  - ESP_OK: Storage mounted successfully
- *  - ESP_ERR_INVALID_STATE: Unable to register the FATFS object to VFS
+        return ESP_OK;
  *  - ESP_ERR_NOT_FOUND: Filesystem not found on the mounted drive
  */
 static esp_err_t msc_storage_mount(msc_storage_obj_t *storage)

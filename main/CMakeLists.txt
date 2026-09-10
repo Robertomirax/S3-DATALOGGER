@@ -15,5 +15,6 @@ idf_component_register(
         fatfs
         wear_levelling
         esp_partition
+        app_update
         esp_tinyusb
             )

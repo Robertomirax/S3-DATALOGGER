@@ -1,29 +1,71 @@
 # Datalogger ESP32-S3
 
-Proyecto basado en ESP-IDF para capturar, guardar y retransmitir datos UART provenientes de una celda de carga o equipo compatible con el protocolo de Alert Technologies.
+Proyecto basado en ESP-IDF para capturar, guardar y exponer datos UART de una celda de carga o equipo compatible con el protocolo de Alert Technologies. La versión actual del firmware está orientada a una placa ESP32-S3 con almacenamiento FAT en flash, USB MSC y visualización OLED SSD1306.
 
-## Descripción breve
+## Resumen del sistema
 
-- recibe datos por UART
-- detecta la cabecera del equipo
-- parsea tramas con una máquina de estados
-- acumula los datos en RAM
-- guarda los datos en una partición FAT con wear leveling
-- conserva los datos iniciales y compacta las secuencias del loop después de detectar su cabecera
-- puede exponerse como pendrive USB mediante el conector USB OTG del ESP32-S3
-- puede retransmitir el log por UART
-- muestra los estados y avisos del sistema en un OLED SSD1306
-- mide el voltaje de la batería mediante el ADC
-- informa el voltaje de la batería en el monitor serie cada 5 segundos
-- muestra el voltaje y el estado de la batería en un OLED SSD1306 de 128x64
+- Captura de datos por UART con la celda de carga.
+- Detección de cabecera y parsing de tramas con máquina de estados.
+- Almacenamiento compacto en la partición FAT `/archivos`.
+- Generación automática de la imagen FAT desde la carpeta `archivos` con `fatfs_create_spiflash_image`.
+- Modo USB automático cuando no llega la cabecera durante 5 segundos.
+- Exposición de la partición como pendrive por USB MSC (TinyUSB).
+- Actualización OTA desde un archivo `firmware.bin` colocado en la raíz del pendrive.
+- Monitor serie con voltaje de batería cada 5 segundos.
+- OLED SSD1306 de 128x64 con batería y estado del sistema.
+
+## Configuración actual del hardware
+
+La implementación actual del código define estos valores:
+
+- UART del logger: `UART_NUM_1`
+- TX: `GPIO17`
+- RX: `GPIO18`
+- Velocidad: `300 bauds`
+- ADC de batería: `GPIO5` (`ADC1_CH4`)
+- Divisor de batería: `2.03`
+- OLED: SSD1306 monocromo 128x64
+- SDA: `GPIO11`
+- SCL: `GPIO12`
+- Dirección I2C: `0x3C`
+- Velocidad I2C: `400 kHz`
+
+Estos valores quedan centralizados en [main/hardware.h](main/hardware.h).
 
 ## Requisitos
 
-- ESP-IDF v6.1 o compatible
+- ESP-IDF 6.1 (ruta prevista: `C:\esp\v6.1\esp-idf`)
 - Python 3.11
-- VS Code con soporte para ESP-IDF o terminal PowerShell
-- placa ESP32-S3
-- conexión UART con la celda de carga
+- PowerShell o terminal con soporte de ESP-IDF
+- VS Code con la extensión ESP-IDF o acceso directo a `idf.py`
+- Placa ESP32-S3 con conector USB nativo para programación y USB MSC
+- Celda de carga o equipo Alert Technologies conectado al UART
+
+## Configuración del proyecto
+
+El proyecto usa una raíz CMake con la creación automática de la imagen FAT:
+
+```cmake
+cmake_minimum_required(VERSION 3.22)
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(S3-DATALOGGER)
+
+fatfs_create_spiflash_image(archivos archivos FLASH_IN_PROJECT)
+```
+
+La partición `archivos` se define en [partitions.csv](partitions.csv) con el siguiente esquema:
+
+- `nvs`
+- `otadata`
+- `ota_0`
+- `ota_1`
+- `phy`
+- `archivos` como `fat` en la zona final del flash
+
+La partición FAT se monta como `/archivos` y se usa para guardar:
+
+- `/archivos/log_uart.txt`
+- `/archivos/firmware.bin`
 
 ## Compilar
 
@@ -35,51 +77,61 @@ $env:IDF_PATH = 'C:\esp\v6.1\esp-idf'
 idf.py build
 ```
 
+También está disponible el helper del proyecto:
+
+```powershell
+. .\tools\setup-esp-idf.ps1
+idf.py build
+```
+
 ## Flashear
+
+Para programar la placa en modo bootloader ROM:
+
+1. Conecta la placa por USB-C.
+2. Mantén pulsado `BOOT`.
+3. Pulsa `RESET` o `EN`.
+4. Suelta `BOOT`.
+5. Usa el puerto serial/JTAG que aparezca en Windows.
 
 ```powershell
 $env:IDF_PATH = 'C:\esp\v6.1\esp-idf'
 . "$env:IDF_PATH\export.ps1"
-idf.py -p COM15 flash
+idf.py -p COMx flash
 ```
 
-Ajusta COM15 al puerto real de tu placa.
+Sustituye `COMx` por el puerto real de la placa.
 
-## Modos de funcionamiento
+> La primera carga completa de la placa debe incluir la imagen FAT de la partición. El proyecto ya genera `build/archivos.bin` desde la carpeta `archivos` y esto es necesario para preparar el volumen FAT inicial.
 
-Después de cada reinicio, el firmware arranca como datalogger y espera hasta 5
-segundos la cabecera de la celda (`Alert Technologies...Version`). Si recibe la
-cabecera, continúa capturando datos por UART y los guarda en
-`/archivos/log_uart.txt`. Si no la recibe, cierra la captura y cambia
-automáticamente al modo USB.
+## Modo de funcionamiento
 
-El cambio a USB se realiza únicamente de forma automática cuando no se recibe la
-cabecera durante esos 5 segundos. No existe un comando manual para cambiar a USB.
+Después de cada reinicio, el firmware arranca en modo datalogger y espera hasta 5 segundos la cabecera de la celda. Si la cabecera no llega, cambia automáticamente a modo USB y expone la partición FAT por Mass Storage.
 
-### Uso como pendrive
+### Modo logger
 
-El firmware expone la partición `archivos` como una unidad FAT por USB Mass Storage.
-Conecta el cable al puerto USB nativo/OTG del ESP32-S3, no al USB-UART, y el sistema
-operativo debería mostrar una unidad extraíble de aproximadamente 1,8 MB.
+- Espera la cabecera `Alert Technologies...Version`.
+- Captura datos UART.
+- Recolecta y compacta tramas.
+- Guarda el resultado en `/archivos/log_uart.txt`.
+- Muestra el voltaje en OLED y serie cada 5 segundos.
 
-Al entrar en modo USB, el logger detiene las tareas de captura y no vuelve a
-acceder a la partición mientras el ordenador la usa, evitando corrupción del
-sistema de archivos.
+### Modo USB
 
-En este modo no se muestra ni se actualiza el voltaje de batería en el OLED.
+- La partición `archivos` se expone como pendrive por USB OTG.
+- Se detienen las tareas de captura y acceso al sistema de archivos para evitar corrupción.
+- La batería no se muestra en el OLED mientras se está en modo USB.
+- La desconexión USB se usa como señal para recuperar la FAT y validar una actualización OTA.
 
-Para volver a registrar, desconecta el USB y conecta la celda de carga.
+## Actualización OTA desde pendrive
 
-La primera vez que se prepara una partición FAT nueva hay que flashear el firmware
-y la imagen de datos:
+1. Compila el firmware y genera `build/S3-DATALOGGER.bin`.
+2. Copia ese archivo al pendrive con el nombre `firmware.bin`.
+3. Expulsa la unidad desde Windows.
+4. Desconecta el cable USB-C.
+5. El sistema detecta la desconexión, valida la imagen y la instala en la OTA alternativa.
 
-```powershell
-idf.py -p COM15 flash
-```
-
-Este comando también debe flashear `build/archivos.bin`, generado desde la
-carpeta `archivos`. La imagen contiene el sistema FAT inicial; el firmware no
-formatea automáticamente la partición para evitar perder los archivos existentes.
+Si el archivo no existe o la imagen no es válida, el sistema reinicia sin tocar el firmware actual.
 
 ## Monitor serie
 
@@ -91,89 +143,64 @@ idf.py -p COM15 monitor
 
 ## Funcionamiento esperado
 
-- `SECUENCIA ACTIVA`: se recibió la primera trama de la celda
-- `TECNOLOGIA DETECTADA`: se detectó la cabecera del equipo
-- `SIN DATOS UART`: no están llegando datos de la celda durante más de 30 s
-- `BAT: ... V`: muestra el voltaje en la primera línea del OLED
-- Cada trama procesada se muestra debajo de la línea de batería
+- `SECUENCIA ACTIVA`: la primera trama de la celda fue detectada.
+- `TECNOLOGIA DETECTADA`: se recibió la cabecera del equipo.
+- `SIN DATOS UART`: no llegan datos durante más de 30 segundos.
+- `BAT: ... V`: voltaje de batería en la primera línea del OLED.
+- Las tramas procesadas se muestran debajo de la línea de batería.
 
-## Formato del archivo
+## Formato del archivo de log
 
-Antes de detectar el loop se conserva el flujo UART recibido para diagnóstico.
-Después de la cabecera:
+Antes de detectar el loop se conserva el flujo UART recibido para diagnóstico. Tras reconocer la cabecera, el sistema genera un log compacto:
 
 ```text
 "Running:"
 "   seq #","ld cella","     dac","    temp","    tare"
-	00001,     01970,     00752,     02132,         0
+00001,     01970,     00752,     02132,         0
 ```
 
-Cada registro del loop se reconstruye mediante el parser y se guarda compactado
-en `/archivos/log_uart.txt`, en lugar de copiar el bloque UART crudo.
+Cada línea se reconstruye desde el parser y se guarda en `/archivos/log_uart.txt` en lugar de registrar el bloque UART crudo completo.
 
-## Medición de batería
+## Datos clave del firmware
 
-- Entrada ADC: `GPIO5` (`ADC1_CH4` en ESP32-S3)
-- Relación configurada del divisor resistivo: `2.03`
-- La lectura se calibra con el ADC del ESP-IDF cuando hay calibración disponible
-- El valor se muestra en el monitor serie en milivoltios y voltios
+- Proyecto: `S3-DATALOGGER`
+- Versión de firmware en pantalla: `FIRM 35`
+- Varios de estado y UI se gestionan desde [main/main.c](main/main.c)
+- Inicialización de hardware, periféricos y USB MSC en [main/hardware.c](main/hardware.c)
+- Pines, ADC y configuración OLED en [main/hardware.h](main/hardware.h)
 
-La relación del divisor debe coincidir con el circuito instalado. Se configura en `BAT_VOLTAGE_DIVIDER_RATIO` dentro de [main/hardware.h](main/hardware.h).
-
-## Display OLED SSD1306
-
-El proyecto admite el módulo OLED SSD1306 monocromático de 0.96 pulgadas, resolución 128x64, con interfaz I2C.
-
-| Módulo OLED | ESP32-S3 |
-| --- | --- |
-| VCC | 3.3 V |
-| GND | GND |
-| SDA | GPIO11 |
-| SCL | GPIO12 |
-
-- Dirección I2C configurada: `0x3C`
-- Velocidad I2C: 400 kHz
-- La primera línea del OLED muestra `BAT:` y el voltaje medido
-- Las líneas restantes muestran el contenido de la última trama procesada
-- En modo USB no se muestra la línea de batería
-- Si el módulo utiliza la dirección `0x3D`, cambia `OLED_I2C_ADDRESS` en [main/hardware.h](main/hardware.h)
-- Verifica que el módulo sea de 3.3 V o utiliza adaptación de nivel si requiere 5 V
-
-## Archivos importantes
-
-- [CMakeLists.txt](CMakeLists.txt): configuración del proyecto
-- [main/main.c](main/main.c): lógica principal del datalogger
-- [main/hardware.c](main/hardware.c): inicialización del hardware
-- [main/hardware.h](main/hardware.h): pines y configuración hardware
-- [partitions.csv](partitions.csv): partición FAT expuesta por USB MSC
-
-## Historico de versiones
+## Historial de versiones
 
 ### Versión 25
-Se probó con display ST7789 240x240. Consumo total aproximado 120 mA.
+Se probó con display ST7789 de 240x240. Consumo aproximado: 120 mA.
 
 ### Versión 27
-Display apagado. Consumo aproximado 85 mA.
+Display apagado. Consumo aproximado: 85 mA.
 
 ### Versión 28
 Se añadió señalización de estados de la celda.
 
 ### Versión 29
-Se eliminaron las rutinas de LVGL y se mantiene el almacenamiento en LittleFS.
+Se eliminaron las rutinas de LVGL y se mantiene almacenamiento en LittleFS.
 
 ### Versión 30
-Se añadió la medición de batería por ADC en GPIO5. El voltaje se registra cada 5 segundos y se muestra en el OLED.
+Se añadió medida de batería por ADC en GPIO5. El voltaje se registra cada 5 segundos y se muestra en el OLED.
 
 ### Versión 31
-Se añadió soporte para el display OLED SSD1306 128x64 por I2C. Muestra el voltaje y el estado de la batería.
+Se añadió soporte para display OLED SSD1306 128x64 por I2C. Muestra voltaje y estado de la batería.
 
 ### Versión actual
-Se añadió el cambio automático a USB después de 5 segundos sin recibir la
-cabecera de la celda. Se eliminó el comando manual `usb`, se corrigió el cierre
-de las tareas FreeRTOS al entrar en USB y se ajustó el registro para compactar
-las tramas del loop. En modo USB se oculta el voltaje de batería del OLED.
+Se añadió la transición automática a USB tras 5 segundos sin cabecera de la celda, se eliminó el comando manual `usb`, se corrigió el cierre de tareas al entrar en USB y se ajustó la compactación del log del loop. En modo USB se oculta la batería del OLED.
 
+## Archivos importantes
 
+- [CMakeLists.txt](CMakeLists.txt): configuración principal del proyecto
+- [main/CMakeLists.txt](main/CMakeLists.txt): componentes y requerimientos del firmware
+- [main/main.c](main/main.c): lógica principal del datalogger
+- [main/hardware.c](main/hardware.c): inicialización del hardware y del USB MSC
+- [main/hardware.h](main/hardware.h): pines y definiciones hardware
+- [partitions.csv](partitions.csv): tabla de particiones del flash
+- [archivos/README.md](archivos/README.md): detalle de la partición FAT generada por el proyecto
 
 
 

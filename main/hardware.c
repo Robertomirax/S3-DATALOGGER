@@ -46,9 +46,17 @@ static bool oled_loop_pending_zero = false;
 static bool oled_loop_preview_active = false;
 static bool oled_status_active = false;
 static bool usb_msc_active = false;
+static volatile bool usb_msc_detached = false;
 
 static tinyusb_msc_storage_handle_t msc_storage_handle;
 static wl_handle_t msc_wl_handle = WL_INVALID_HANDLE;
+
+static void usb_event_callback(tinyusb_event_t *event, void *arg) {
+  (void)arg;
+  if (event != NULL && event->id == TINYUSB_EVENT_DETACHED) {
+    usb_msc_detached = true;
+  }
+}
 
 static const uint8_t *oled_glyph(char character) {
   if (character >= 'a' && character <= 'z') {
@@ -133,6 +141,18 @@ static void oled_draw_battery_line(void) {
   }
 }
 
+static void oled_draw_firmware_line(void) {
+  char firmware_text[16];
+  int firmware_length = snprintf(firmware_text, sizeof(firmware_text), "FIRM %d", FIRM);
+  if (firmware_length <= 0) {
+    return;
+  }
+
+  int firmware_width = firmware_length * 6;
+  uint8_t column = firmware_width < 128 ? (uint8_t)(128 - firmware_width) : 0;
+  oled_draw_text(firmware_text, column, 0);
+}
+
 static void oled_loop_append_char(char character) {
   if (oled_loop_preview_len < 21) {
     oled_loop_preview[22 + oled_loop_preview_len++] = character;
@@ -189,6 +209,7 @@ static void oled_render_frame(void) {
   if (oled_battery_visible) {
     oled_draw_battery_line();
   }
+  oled_draw_firmware_line();
   if (oled_status_active) {
     oled_draw_text(oled_status_title, 0, 2);
     oled_draw_wrapped_text(oled_status_message, 4);
@@ -522,6 +543,8 @@ static esp_err_t init_storage(void) {
 
 bool hardware_usb_msc_active(void) { return usb_msc_active; }
 
+bool hardware_usb_msc_detached(void) { return usb_msc_detached; }
+
 esp_err_t hardware_enter_usb_msc(void) {
   if (usb_msc_active) {
     return ESP_OK;
@@ -529,6 +552,8 @@ esp_err_t hardware_enter_usb_msc(void) {
   if (msc_storage_handle == NULL) {
     return ESP_ERR_INVALID_STATE;
   }
+
+  usb_msc_detached = false;
 
   esp_err_t error = tinyusb_msc_set_storage_mount_point(
       msc_storage_handle, TINYUSB_MSC_STORAGE_MOUNT_USB);
@@ -538,6 +563,7 @@ esp_err_t hardware_enter_usb_msc(void) {
   }
 
   tinyusb_config_t usb_config = TINYUSB_DEFAULT_CONFIG();
+  usb_config.event_cb = usb_event_callback;
   error = tinyusb_driver_install(&usb_config);
   if (error != ESP_OK) {
     ESP_LOGE(TAG, "No se pudo iniciar el dispositivo USB: %s", esp_err_to_name(error));
@@ -546,6 +572,29 @@ esp_err_t hardware_enter_usb_msc(void) {
 
   usb_msc_active = true;
   ESP_LOGI(TAG, "Pendrive USB listo; la aplicacion no accedera al volumen FAT");
+  return ESP_OK;
+}
+
+esp_err_t hardware_exit_usb_msc(void) {
+  if (!usb_msc_active) {
+    return ESP_OK;
+  }
+
+  esp_err_t error = tinyusb_msc_set_storage_mount_point(
+      msc_storage_handle, TINYUSB_MSC_STORAGE_MOUNT_APP);
+  if (error != ESP_OK) {
+    ESP_LOGE(TAG, "No se pudo recuperar la FAT para la aplicacion: %s", esp_err_to_name(error));
+    return error;
+  }
+
+  error = tinyusb_driver_uninstall();
+  if (error != ESP_OK) {
+    ESP_LOGE(TAG, "No se pudo detener el dispositivo USB: %s", esp_err_to_name(error));
+    return error;
+  }
+
+  usb_msc_active = false;
+  ESP_LOGI(TAG, "FAT disponible para la aplicacion");
   return ESP_OK;
 }
 
