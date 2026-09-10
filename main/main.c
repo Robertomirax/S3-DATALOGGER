@@ -21,7 +21,7 @@
 static const char *TAG = "MAIN_APP";
 static const char *TAG_FLASH = "FLASH_WRITER";
 static const char *log_path = "/archivos/log_uart.txt";
-static const char *update_path = "/archivos/firmware.bin";
+static const char *update_path = "/archivos/S3-DATALOGGER.bin";
 
 // static const char DL_HEADER1[] = "\x55\x55\x55\x55\x55\x55\x55";
 static const char DL_HEADER2[] = "\r\n\r\nAlert Technologies\r\nDATALOGGER "
