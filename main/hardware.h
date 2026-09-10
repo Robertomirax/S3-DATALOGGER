@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define FIRM 36 // Version del firmware
+#define FIRM 37 // Version del firmware
 
 // --- CONFIGURACIÓN UART / MAX3232 ---
 // El puerto UART_1 se usa para la comunicación con la celda de carga.
