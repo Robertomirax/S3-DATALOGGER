@@ -44,10 +44,14 @@ typedef struct {
 
 static ring_buffer_t rb;
 
-// Verifica que el mutex del buffer circular haya sido inicializado.
+// Comprueba que el ring buffer esta listo para usarse.
+// Separar esta comprobacion evita que las tareas intenten tomar un mutex nulo
+// durante un fallo de inicializacion y permite abortar la operacion limpiamente.
 static bool ring_buffer_ready(void) { return rb.mutex != NULL; }
 
-// Inicializa el buffer circular y crea el mutex de protección.
+// Inicializa indices, contador y mutex del buffer circular compartido.
+// El buffer empieza vacio y el mutex serializa al receptor UART, al escritor
+// de flash y a la tarea de transmision cuando acceden a los mismos bytes.
 static void ring_buffer_init(void) {
   rb.head = 0;
   rb.tail = 0;
@@ -58,7 +62,9 @@ static void ring_buffer_init(void) {
   }
 }
 
-// Escribe bytes al buffer circular protegidos por mutex.
+// Inserta tantos bytes como quepan en el ring buffer bajo proteccion del mutex.
+// No sobrescribe datos pendientes: cuando se llena, devuelve la cantidad real
+// escrita para que el llamador pueda reintentar o registrar la perdida.
 static size_t ring_buffer_write(const uint8_t *data, size_t len) {
   if (!ring_buffer_ready() || data == NULL || len == 0)
     return 0;
@@ -83,7 +89,9 @@ static size_t ring_buffer_write(const uint8_t *data, size_t len) {
   return bytes_written;
 }
 
-// Intenta guardar un bloque completo en RAM, reintentando si el buffer está ocupado.
+// Garantiza la insercion de un bloque completo o informa que no fue posible.
+// Reintenta durante cinco segundos porque el escritor de flash puede liberar
+// espacio entre llamadas; asi se evita partir una trama compactada a medias.
 static bool ring_buffer_write_all(const uint8_t *data, size_t len) {
   if (!ring_buffer_ready() || data == NULL || len == 0)
     return false;
@@ -105,7 +113,9 @@ static bool ring_buffer_write_all(const uint8_t *data, size_t len) {
   return false;
 }
 
-// Copia datos del buffer circular hacia un buffer externo sin consumirlos.
+// Copia bytes pendientes sin mover la cola del ring buffer.
+// La operacion permite inspeccionar o escribir un bloque y solo retirarlo
+// despues de confirmar que la operacion externa tuvo exito.
 static size_t ring_buffer_peek(uint8_t *out_buf, size_t max_len) {
   if (!ring_buffer_ready() || out_buf == NULL || max_len == 0)
     return 0;
@@ -124,7 +134,9 @@ static size_t ring_buffer_peek(uint8_t *out_buf, size_t max_len) {
   return bytes_read;
 }
 
-// Elimina bytes ya procesados del buffer circular y avanza la cola.
+// Confirma que una cantidad de bytes ya fue procesada y avanza la cola.
+// Limita la eliminacion al contenido real para mantener consistente el
+// contador aunque el llamador solicite mas bytes de los disponibles.
 static size_t ring_buffer_drop(size_t len) {
   if (!ring_buffer_ready())
     return 0;
@@ -140,7 +152,9 @@ static size_t ring_buffer_drop(size_t len) {
   return bytes_dropped;
 }
 
-// Vacía el contenido del buffer circular para reiniciar el almacenamiento en RAM.
+// Descarta todos los bytes pendientes y reinicia los indices del ring buffer.
+// Se usa al confirmar el comando de autodiagnostico despues de truncar el
+// archivo, dejando RAM y almacenamiento persistente en el mismo punto.
 static void ring_buffer_clear(void) {
   if (!ring_buffer_ready())
     return;
@@ -153,7 +167,9 @@ static void ring_buffer_clear(void) {
   }
 }
 
-// Devuelve cuántos bytes hay pendientes actualmente en el buffer circular.
+// Obtiene de forma segura la cantidad de bytes que aun esperan persistencia.
+// El valor se toma bajo mutex para que no quede a mitad de una escritura del
+// receptor o de una retirada realizada por otra tarea.
 static size_t ring_buffer_get_count(void) {
   size_t count = 0;
   if (!ring_buffer_ready())
@@ -215,6 +231,12 @@ static const char running_header[] =
 static char running_context[sizeof(running_header)];
 static size_t running_context_len = 0;
 
+// Conserva el numero que acaba de terminar en el flujo UART.
+//
+// `procesar_running` recibe datos por bloques y puede encontrar un numero
+// dividido entre dos bloques. Esta rutina copia el acumulador temporal a la
+// variable estable que se usara cuando aparezca el encabezado `Running:`.
+// Si no hay caracteres acumulados, no modifica el ultimo valor valido.
 static void guardar_valor_numerico_actual(void) {
   if (valor_numerico_len == 0)
     return;
@@ -225,7 +247,12 @@ static void guardar_valor_numerico_actual(void) {
   valor_numerico_len = 0;
 }
 
-// Busca el encabezado completo y muestra el último número, incluso si llegan en bloques distintos.
+// Busca el encabezado completo `Running:` y actualiza la tara del OLED.
+//
+// Mantiene una ventana de contexto para reconocer el encabezado aunque este
+// llegue partido entre varias lecturas UART. Al mismo tiempo detecta numeros
+// precedentes y, cuando la secuencia coincide, convierte el ultimo numero a
+// porcentaje de tara antes de enviarlo a la capa de hardware.
 static void procesar_running(const uint8_t *data, size_t len) {
   for (size_t i = 0; i < len; i++) {
     char c = (char)data[i];
@@ -260,7 +287,9 @@ static void procesar_running(const uint8_t *data, size_t len) {
   }
 }
 
-// Reinicia el buffer de línea para comenzar una nueva trama desde cero.
+// Borra el contenido y los indicadores asociados a la linea en construccion.
+// Se llama al comenzar una nueva trama para evitar que datos de la anterior
+// alteren el resultado del parser o la posicion del indicador de tara.
 static void reset_line_buffer(void) {
   line_idx = 0;
   pos_flag_tara = 0;
@@ -268,7 +297,9 @@ static void reset_line_buffer(void) {
   memset(line_buf, 0, sizeof(line_buf));
 }
 
-// Restablece el estado completo del parser para una nueva captura de datos.
+// Devuelve la maquina de estados a su estado inicial de espera de CRLF.
+// Tambien reinicia el byte anterior y el buffer de linea, por lo que puede
+// usarse tanto al arrancar como despues de borrar la memoria capturada.
 static void reset_capture_state(void) {
   subestado_loop = WAIT_CRLF_1;
   last_byte = 0x00;
@@ -276,7 +307,9 @@ static void reset_capture_state(void) {
   reset_line_buffer();
 }
 
-// Agrega un único carácter al buffer de línea si hay espacio disponible.
+// Agrega un caracter a la linea compactada si queda espacio para el terminador.
+// Cuando la entrada excede el buffer no escribe fuera de los limites: marca
+// `line_overflow` para que la trama completa pueda descartarse al finalizar.
 static void append_char_to_line(char c) {
   if (line_idx < sizeof(line_buf) - 1) {
     line_buf[line_idx++] = c;
@@ -286,7 +319,9 @@ static void append_char_to_line(char c) {
   }
 }
 
-// Agrega una cadena al buffer de línea, marcando overflow si supera el tamaño.
+// Agrega una cadena completa al buffer de linea con la misma proteccion de
+// limites que `append_char_to_line`. La marca de overflow se conserva para
+// que el parser no guarde una linea truncada como si fuera valida.
 static void append_str_to_line(const char *str) {
   while (*str && (line_idx < sizeof(line_buf) - 1)) {
     line_buf[line_idx++] = *str++;
@@ -296,7 +331,9 @@ static void append_str_to_line(const char *str) {
     line_overflow = true;
 }
 
-// Detecta si la secuencia UART incluye la cabecera de identificación del equipo.
+// Detecta la cabecera de identificacion del equipo dentro de un bloque de UART.
+// Exige tanto el prefijo de Alert Technologies como el separador de version,
+// reduciendo el riesgo de activar el modo logger por una coincidencia parcial.
 static bool alerta_tecnologias_recibida(const char *stream) {
   if (stream == NULL)
     return false;
@@ -315,7 +352,12 @@ static bool alerta_tecnologias_recibida(const char *stream) {
 // ---------------------------------------------------------------------------
 // Procesador byte a byte
 // ---------------------------------------------------------------------------
-// Parsea la secuencia UART y reconstruye cada línea de datos antes de guardarla.
+// Consume bytes UART y reconstruye una trama compactada mediante una maquina
+// de estados. La rutina espera el CRLF inicial, selecciona los campos que se
+// almacenan, elimina ceros segun el formato del equipo y aplica el bit de
+// tara. Al terminar una trama actualiza el OLED y la encola en el ring buffer.
+// El estado se conserva entre llamadas porque una lectura UART puede terminar
+// en mitad de cualquier campo.
 static void procesar_loop_secuencia(uint8_t *buf, size_t len) {
   if (buf == NULL || len == 0) {
     return;
@@ -427,8 +469,10 @@ static void procesar_loop_secuencia(uint8_t *buf, size_t len) {
 // ---------------------------------------------------------------------------
 // Tareas Secundarias (Flash Writer)
 // ---------------------------------------------------------------------------
-// Esta tarea asegura que el contenido acumulado en RAM se vuelque a la
-// partición LittleFS periódicamente o cuando supera el umbral definido.
+// Tarea productora de escrituras: traslada datos del ring buffer a la FAT.
+// Despierta periodicamente y escribe cuando hay 2 KB pendientes o cuando han
+// pasado cinco segundos, manteniendo el mutex del archivo durante toda la
+// operacion para coordinarse con el borrado, la transmision y el USB.
 static void flash_writer_task(void *arg) {
   uint8_t *write_buf = (uint8_t *)malloc(TEMP_WRITE_BUF_SIZE);
   if (!write_buf) {
@@ -492,6 +536,9 @@ static void flash_writer_task(void *arg) {
   vTaskDelete(NULL);
 }
 
+// Fuerza el volcado de todas las tramas pendientes antes de ceder la FAT al
+// host USB. Devuelve true solo si el archivo se pudo abrir, sincronizar y el
+// ring buffer quedo completamente vacio.
 static bool flush_pending_log(void) {
   uint8_t *write_buf = (uint8_t *)malloc(TEMP_WRITE_BUF_SIZE);
   if (write_buf == NULL || file_mutex == NULL) {
@@ -520,6 +567,10 @@ static bool flush_pending_log(void) {
   return success;
 }
 
+// Instala una imagen OTA encontrada en la particion FAT.
+// Lee el binario por bloques, lo escribe en la particion OTA alternativa,
+// finaliza la validacion de ESP-IDF y cambia la particion de arranque. El
+// archivo solo se elimina despues de completar todos esos pasos correctamente.
 static bool install_firmware_update(void) {
   FILE *file = fopen(update_path, "rb");
   if (file == NULL) {
@@ -593,6 +644,9 @@ static bool install_firmware_update(void) {
   return success;
 }
 
+// Espera la desconexion fisica del pendrive y recupera el control de la FAT.
+// Una vez desmontado el USB busca una imagen OTA; si la instala, reinicia para
+// arrancar el nuevo firmware, y si no, reinicia conservando el firmware actual.
 static void usb_update_task(void *arg) {
   (void)arg;
 
@@ -614,6 +668,9 @@ static void usb_update_task(void *arg) {
   esp_restart();
 }
 
+// Decide el modo de arranque cuando no se recibe la cabecera de la celda.
+// Tras cinco segundos vacia el log pendiente y entrega la particion al USB;
+// si la cabecera ya llego, termina sin interferir con el modo logger.
 static void startup_mode_task(void *arg) {
   (void)arg;
   vTaskDelay(pdMS_TO_TICKS(5000));
@@ -642,6 +699,9 @@ static void startup_mode_task(void *arg) {
   vTaskDelete(NULL);
 }
 
+// Verifica que el archivo de log pueda crearse o abrirse en la FAT montada.
+// No escribe datos; sirve como comprobacion temprana antes de crear tareas que
+// dependan del almacenamiento.
 static bool ensure_log_file(void) {
   FILE *file = fopen(log_path, "a");
   if (file == NULL) {
@@ -658,6 +718,9 @@ static bool ensure_log_file(void) {
   return true;
 }
 
+// Crea el README inicial de la particion FAT si aun no existe.
+// La operacion es deliberadamente idempotente para no reemplazar el archivo
+// que el usuario pueda haber dejado en el volumen USB.
 static bool ensure_root_readme(void) {
   const char *readme_path = "/archivos/README.md";
   FILE *existing = fopen(readme_path, "r");
@@ -694,7 +757,9 @@ static bool ensure_root_readme(void) {
   return true;
 }
 
-// Muestra en el OLED la pérdida de datos UART después de una secuencia activa.
+// Supervisa el silencio del UART una vez iniciada la secuencia.
+// Muestra un aviso unico cuando transcurren mas de 30 segundos sin datos y lo
+// habilita de nuevo cuando la recepcion se reanuda.
 static void secuencia_estado_task(void *arg) {
   bool aviso_sin_datos = false;
 
@@ -722,7 +787,9 @@ static void secuencia_estado_task(void *arg) {
 // Tareas Principales
 // ---------------------------------------------------------------------------
 
-// Mide la batería y deja el valor en la terminal de depuración cada 10 segundos.
+// Tarea periodica de supervision de bateria.
+// Lee el ADC cada cinco segundos, publica el voltaje en el log y actualiza la
+// linea correspondiente del OLED. La tarea se detiene al entrar en modo USB.
 static void battery_voltage_task(void *arg) {
   while (!modo_usb) {
     int battery_voltage_mv = hardware_read_battery_voltage_mv();
@@ -743,7 +810,10 @@ static void battery_voltage_task(void *arg) {
   vTaskDelete(NULL);
 }
 
-// Transmite el archivo de log almacenado en flash a través del puerto UART.
+// Atiende el comando `send` y transmite el log completo por UART.
+// Primero vacia en el archivo los datos que aun estan en RAM, cambia a 4800
+// baudios para la transferencia y finalmente envia el comando de retorno a
+// 300 baudios, que es la velocidad normal de captura.
 static void tx_file_task(void *arg) {
   uint8_t *tx_buffer = (uint8_t *)malloc(UART_BUF_SIZE);
   if (tx_buffer == NULL) {
@@ -811,7 +881,10 @@ static void tx_file_task(void *arg) {
   vTaskDelete(NULL);
 }
 
-// Recibe datos UART y coordina el parseo, comandos RS-232 y captura de tramas.
+// Tarea principal de recepcion UART y coordinacion del datalogger.
+// Conserva datos previos al loop, reconoce la cabecera de captura, atiende los
+// comandos `send` y `mtest`, mantiene solapamiento entre bloques y entrega el
+// flujo continuo a la maquina de estados. Libera sus buffers al cambiar a USB.
 static void rx_task(void *arg) {
   uint8_t *data = (uint8_t *)malloc(UART_BUF_SIZE);
   char *stream_buf = (char *)malloc(UART_BUF_SIZE + 64);
@@ -931,17 +1004,16 @@ static void rx_task(void *arg) {
 
           if (match != NULL) {
             size_t stream_match_idx = match - stream_buf;
-            size_t data_match_start_idx = stream_match_idx > overlap_len
-                              ? stream_match_idx - overlap_len
-                              : 0;
             size_t data_match_end_idx =
                 (stream_match_idx >= overlap_len) ? (stream_match_idx - overlap_len + target_len) : (target_len - (overlap_len - stream_match_idx));
 
             // Transición a la captura continua de tramas
 
             ESP_LOGI(TAG, "Cabecera detectada. Iniciando captura de tramas...");
-            if (data_match_start_idx > 0 &&
-                !ring_buffer_write_all(data, data_match_start_idx)) {
+            // El encabezado de Running tambien forma parte del log. Antes solo
+            // se conservaba lo anterior a "seq #", descartando esta fila.
+            if (data_match_end_idx > 0 &&
+                !ring_buffer_write_all(data, data_match_end_idx)) {
               ESP_LOGE(TAG, "Datos previos al loop descartados por falta de espacio en RAM.");
             }
             estado_grabado = 2;
@@ -993,8 +1065,10 @@ static void rx_task(void *arg) {
 // ---------------------------------------------------------------------------
 // Entrada Principal (Main)
 // ---------------------------------------------------------------------------
-// Punto de entrada del firmware: crea los mutex, inicializa el hardware,
-// restaura el estado de captura y lanza las tareas del sistema.
+// Punto de entrada de FreeRTOS para el firmware.
+// Crea las primitivas de sincronizacion, monta e inicializa el hardware,
+// comprueba el almacenamiento, procesa una OTA pendiente y lanza las tareas
+// de recepcion, persistencia, supervision, bateria y seleccion de modo.
 void app_main(void) {
   ESP_LOGI(TAG, "Inicializando Hardware y Estructuras de Memoria...");
 

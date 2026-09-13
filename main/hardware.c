@@ -17,6 +17,7 @@
 #include "tinyusb_default_config.h"
 #include "tinyusb_msc.h"
 #include "wear_levelling.h"
+#include "ff.h"
 #include <stddef.h>
 
 #include <stdint.h>
@@ -51,6 +52,10 @@ static volatile bool usb_msc_detached = false;
 static tinyusb_msc_storage_handle_t msc_storage_handle;
 static wl_handle_t msc_wl_handle = WL_INVALID_HANDLE;
 
+// Callback de TinyUSB ejecutado cuando cambia el estado del dispositivo USB.
+// Solo nos interesa la desconexion: la tarea de actualizacion la consulta para
+// saber cuando el host dejo de usar la particion FAT y puede devolversela a la
+// aplicacion sin riesgo de acceso simultaneo.
 static void usb_event_callback(tinyusb_event_t *event, void *arg) {
   (void)arg;
   if (event != NULL && event->id == TINYUSB_EVENT_DETACHED) {
@@ -58,6 +63,10 @@ static void usb_event_callback(tinyusb_event_t *event, void *arg) {
   }
 }
 
+// Devuelve los cinco bytes de columnas que forman un caracter de la fuente
+// monocroma del SSD1306. La fuente solo contiene mayusculas, digitos y unos
+// signos; por eso convierte minusculas a mayusculas y usa un glifo en blanco
+// cuando recibe un caracter fuera del conjunto soportado.
 static const uint8_t *oled_glyph(char character) {
   if (character >= 'a' && character <= 'z') {
     character = (char)(character - 'a' + 'A');
@@ -88,6 +97,9 @@ static const uint8_t *oled_glyph(char character) {
   return glyphs[36];
 }
 
+// Dibuja una cadena en una pagina concreta del framebuffer del OLED.
+// Cada caracter ocupa cinco columnas mas una columna de separacion. La rutina
+// limita la escritura al ancho de 128 pixeles para proteger el framebuffer.
 static void oled_draw_text(const char *text, uint8_t column, uint8_t page) {
   while (*text != '\0' && column < 123) {
     const uint8_t *glyph = oled_glyph(*text++);
@@ -98,6 +110,9 @@ static void oled_draw_text(const char *text, uint8_t column, uint8_t page) {
   }
 }
 
+// Dibuja texto continuo admitiendo CR/LF y salto automatico de pagina.
+// Se utiliza para mensajes de estado que pueden ocupar varias lineas y deja
+// de escribir cuando alcanza las ocho paginas del panel de 64 pixeles.
 static void oled_draw_wrapped_text(const char *text, uint8_t page) {
   uint8_t column = 0;
   while (*text != '\0' && page < 8) {
@@ -124,6 +139,9 @@ static void oled_draw_wrapped_text(const char *text, uint8_t page) {
   }
 }
 
+// Compone la primera zona de la pantalla con bateria y tara.
+// La tension se muestra en voltios con dos decimales; la tara solo aparece
+// cuando el parser ya recibio un valor valido desde la secuencia Running.
 static void oled_draw_battery_line(void) {
   char battery_text[22];
   if (oled_battery_voltage_mv >= 0) {
@@ -141,6 +159,9 @@ static void oled_draw_battery_line(void) {
   }
 }
 
+// Dibuja el identificador de firmware alineado al borde derecho de la pantalla.
+// La alineacion se calcula a partir del numero de caracteres para que la
+// etiqueta conserve su posicion aunque cambie la version.
 static void oled_draw_firmware_line(void) {
   char firmware_text[16];
   int firmware_length = snprintf(firmware_text, sizeof(firmware_text), "FIRM %d", FIRM);
@@ -153,12 +174,18 @@ static void oled_draw_firmware_line(void) {
   oled_draw_text(firmware_text, column, 0);
 }
 
+// Anexa un caracter a la segunda linea de la vista previa del loop.
+// El area reservada comienza en el indice 22 porque los primeros 22 bytes
+// contienen la linea anterior mostrada en la pantalla.
 static void oled_loop_append_char(char character) {
   if (oled_loop_preview_len < 21) {
     oled_loop_preview[22 + oled_loop_preview_len++] = character;
   }
 }
 
+// Cierra el numero que se estaba acumulando en la vista previa del loop.
+// Si se omitio temporalmente un cero inicial, lo restaura solo al terminar el
+// numero, preservando la representacion util sin llenar el OLED de ceros.
 static void oled_loop_finish_number(void) {
   if (oled_loop_pending_zero) {
     oled_loop_append_char('0');
@@ -167,6 +194,9 @@ static void oled_loop_finish_number(void) {
   oled_loop_number_started = false;
 }
 
+// Extrae hasta cinco grupos numericos de la linea del loop y los compacta.
+// Esta transformacion es exclusivamente visual: el log conserva la trama
+// completa, mientras que el OLED muestra una version legible en 21 columnas.
 static void oled_loop_compact_line(void) {
   char compact_line[22] = {0};
   size_t compact_len = 0;
@@ -204,6 +234,9 @@ static void oled_loop_compact_line(void) {
   oled_loop_preview_len = compact_len;
 }
 
+// Reconstruye el framebuffer completo a partir del estado actual de la UI.
+// Dibuja las capas en orden, borra restos del frame anterior y envia el bitmap
+// terminado al controlador SSD1306 en una sola operacion.
 static void oled_render_frame(void) {
   memset(oled_framebuffer, 0, sizeof(oled_framebuffer));
   if (oled_battery_visible) {
@@ -228,6 +261,9 @@ static void oled_render_frame(void) {
 }
 
 void hardware_init_oled(void) {
+  // Crea el bus I2C, registra el panel SSD1306 y deja el primer framebuffer
+  // visible. Las comprobaciones ESP_ERROR_CHECK detienen el arranque si el
+  // controlador no puede configurarse de forma segura.
   const i2c_master_bus_config_t bus_config = {
       .i2c_port = I2C_NUM_0,
       .sda_io_num = OLED_I2C_SDA_GPIO,
@@ -272,6 +308,9 @@ void hardware_init_oled(void) {
 }
 
 void hardware_oled_show_battery(int voltage_mv) {
+  // Actualiza el valor de bateria almacenado y vuelve a dibujar la pantalla.
+  // No intenta pintar antes de inicializar el panel ni cuando la bateria esta
+  // oculta temporalmente por el modo USB.
   if (oled_panel == NULL || !oled_battery_visible) {
     return;
   }
@@ -280,6 +319,8 @@ void hardware_oled_show_battery(int voltage_mv) {
 }
 
 void hardware_oled_hide_battery(void) {
+  // Desactiva la capa visual de bateria y conserva el resto de la interfaz.
+  // Se usa al ceder la FAT al host USB para indicar el cambio de modo.
   oled_battery_visible = false;
   if (oled_panel != NULL) {
     oled_render_frame();
@@ -287,6 +328,9 @@ void hardware_oled_hide_battery(void) {
 }
 
 void hardware_oled_show_message(const char *title, const char *message) {
+  // Reemplaza la zona central del OLED por un titulo y un mensaje de estado.
+  // Copia las cadenas con limite para que una entrada externa no desborde el
+  // estado persistente de la interfaz.
   if (oled_panel == NULL) {
     return;
   }
@@ -298,6 +342,8 @@ void hardware_oled_show_message(const char *title, const char *message) {
 }
 
 void hardware_oled_show_tara(float tara_percent) {
+  // Registra una tara calculada por el parser y la muestra en pantalla.
+  // Tambien retira el mensaje temporal de estado para volver a la vista normal.
   if (oled_panel == NULL) {
     return;
   }
@@ -309,6 +355,8 @@ void hardware_oled_show_tara(float tara_percent) {
 }
 
 void hardware_oled_show_frame(const char *frame) {
+  // Guarda y muestra la ultima trama compactada recibida del equipo.
+  // Al mostrar una trama se desactiva la vista previa UART anterior.
   if (oled_panel == NULL || frame == NULL) {
     return;
   }
@@ -320,6 +368,9 @@ void hardware_oled_show_frame(const char *frame) {
 }
 
 void hardware_oled_update_uart_preview(const uint8_t *data, size_t len) {
+  // Alimenta la vista previa de la cabecera UART antes de iniciar el loop.
+  // Filtra controles, normaliza tabuladores y conserva solo las dos ultimas
+  // lineas que caben en el OLED; no modifica los datos que se guardan en FAT.
   if (oled_panel == NULL || data == NULL || len == 0) {
     return;
   }
@@ -363,6 +414,9 @@ void hardware_oled_update_uart_preview(const uint8_t *data, size_t len) {
 }
 
 void hardware_oled_clear_uart_preview(void) {
+  // Elimina las vistas previas de cabecera y loop al comenzar la captura.
+  // Reinicia tambien sus contadores para que la siguiente sesion no herede
+  // caracteres de la sesion anterior.
   if (oled_panel == NULL) {
     return;
   }
@@ -377,6 +431,9 @@ void hardware_oled_clear_uart_preview(void) {
 }
 
 void hardware_oled_update_loop_preview(const uint8_t *data, size_t len) {
+  // Actualiza la vista previa de las tramas que ya estan entrando al loop.
+  // Compacta numeros y separadores para adaptarlos a 21 columnas, manteniendo
+  // intacto el flujo original que procesa `main.c`.
   if (oled_panel == NULL || data == NULL || len == 0) {
     return;
   }
@@ -433,6 +490,8 @@ void hardware_oled_update_loop_preview(const uint8_t *data, size_t len) {
 }
 
 void hardware_init_battery_adc(void) {
+  // Descubre el canal ADC asociado al pin, configura su atenuacion y prepara
+  // la calibracion por ajuste de curva cuando el chip y el SDK la soportan.
   adc_unit_t unit;
   ESP_ERROR_CHECK(adc_oneshot_io_to_channel(BAT_VOLTAGE_ADC_PIN, &unit, &battery_adc_channel));
 
@@ -465,6 +524,9 @@ void hardware_init_battery_adc(void) {
 }
 
 int hardware_read_battery_voltage_mv(void) {
+  // Lee la bateria y devuelve milivoltios corregidos por el divisor resistivo.
+  // Prefiere el resultado calibrado; si la calibracion no existe usa la
+  // conversion aproximada del ADC de 12 bits. Devuelve -1 ante un fallo.
   if (battery_adc_handle == NULL) {
     return -1;
   }
@@ -484,6 +546,9 @@ int hardware_read_battery_voltage_mv(void) {
 
 // Configura el puerto UART para la comunicación con la celda de carga.
 void hardware_init_uart(void) {
+  // Configura UART1 con el formato y la velocidad del protocolo de la celda,
+  // asigna los pines definidos en hardware.h, reserva sus buffers y descarta
+  // bytes residuales que pudieran confundirse con una cabecera valida.
   uart_config_t uart_config = {
       .baud_rate = BAUD_RATE,
       .data_bits = UART_DATA_8_BITS,
@@ -505,6 +570,10 @@ void hardware_init_uart(void) {
 }
 
 static esp_err_t init_storage(void) {
+  // Localiza la particion FAT `archivos`, monta wear leveling e instala TinyUSB
+  // MSC con automontaje desactivado. El volumen queda inicialmente montado
+  // para la aplicacion y puede transferirse despues al host USB sin desmontar
+  // ni volver a inicializar la memoria flash.
   ESP_LOGI(TAG, "Inicializando almacenamiento FAT");
 
   const esp_partition_t *partition = esp_partition_find_first(
@@ -537,15 +606,28 @@ static esp_err_t init_storage(void) {
                           &storage_config, &msc_storage_handle),
                       TAG, "No se pudo crear el almacenamiento MSC");
 
+#if CONFIG_FATFS_USE_LABEL
+  f_setlabel("ASIGNA_DL");
+#endif
+
   ESP_LOGI(TAG, "Modo logger activo; FAT montado en /archivos");
   return ESP_OK;
 }
 
+// Informa si TinyUSB tiene actualmente la particion FAT entregada al host.
+// La tarea principal usa este estado para evitar accesos de la aplicacion al
+// volumen mientras Windows lo presenta como pendrive.
 bool hardware_usb_msc_active(void) { return usb_msc_active; }
 
+// Informa si TinyUSB notifico la desconexion fisica del host USB.
+// La bandera permanece activa hasta que se inicia otra sesion USB, permitiendo
+// que una tarea bloqueada en espera detecte el evento sin depender del callback.
 bool hardware_usb_msc_detached(void) { return usb_msc_detached; }
 
 esp_err_t hardware_enter_usb_msc(void) {
+  // Cambia el punto de montaje de la FAT desde la aplicacion al dispositivo
+  // USB e instala TinyUSB. Si alguno de los pasos falla, conserva el volumen
+  // bajo control de la aplicacion y devuelve el error al llamador.
   if (usb_msc_active) {
     return ESP_OK;
   }
@@ -576,6 +658,10 @@ esp_err_t hardware_enter_usb_msc(void) {
 }
 
 esp_err_t hardware_exit_usb_msc(void) {
+  // Devuelve la FAT al punto de montaje de la aplicacion y desinstala TinyUSB.
+  // Solo marca MSC como inactivo despues de completar ambas operaciones para
+  // que el resto del firmware no crea que el volumen ya es utilizable antes
+  // de tiempo.
   if (!usb_msc_active) {
     return ESP_OK;
   }
@@ -598,7 +684,9 @@ esp_err_t hardware_exit_usb_msc(void) {
   return ESP_OK;
 }
 
-// Inicializa toda la capa de hardware del sistema en el orden correcto.
+// Inicializa toda la capa de hardware en el orden requerido por el firmware.
+// Primero monta el almacenamiento, luego configura UART y ADC, y finalmente
+// el OLED, que puede dibujar el estado inicial usando esos valores.
 void hardware_init_all(void) {
   ESP_ERROR_CHECK(init_storage());
 
