@@ -40,11 +40,12 @@ static char oled_status_message[128];
 static char oled_uart_preview[44];
 static size_t oled_uart_preview_len = 0;
 static bool oled_uart_preview_active = false;
-static char oled_loop_preview[44];
+static char oled_loop_preview[88];
 static size_t oled_loop_preview_len = 0;
 static bool oled_loop_number_started = false;
 static bool oled_loop_pending_zero = false;
 static bool oled_loop_preview_active = false;
+static bool oled_loop_pending_shift = false;
 static bool oled_status_active = false;
 static bool usb_msc_active = false;
 static volatile bool usb_msc_detached = false;
@@ -97,25 +98,36 @@ static const uint8_t *oled_glyph(char character) {
   return glyphs[36];
 }
 
-// Dibuja una cadena en una pagina concreta del framebuffer del OLED.
+// Dibuja un glifo de 5 columnas en la fila de pixeles indicada, repartiendo
+// los bits entre dos paginas cuando la fila no coincide con un multiplo de 8.
+// Esto permite un espaciado vertical mas fino que los 8 px de una pagina.
+static void oled_draw_glyph_row(const uint8_t *glyph, uint8_t column, uint8_t row) {
+  uint8_t page = row / 8;
+  uint8_t shift = row % 8;
+  for (uint8_t index = 0; index < 5 && column + index < 128; index++) {
+    oled_framebuffer[(page * 128) + column + index] |= (uint8_t)(glyph[index] << shift);
+    if (shift != 0 && page + 1 < 8) {
+      oled_framebuffer[((page + 1) * 128) + column + index] |= (uint8_t)(glyph[index] >> (8 - shift));
+    }
+  }
+}
+
+// Dibuja una cadena en la fila de pixeles indicada del framebuffer del OLED.
 // Cada caracter ocupa cinco columnas mas una columna de separacion. La rutina
 // limita la escritura al ancho de 128 pixeles para proteger el framebuffer.
-static void oled_draw_text(const char *text, uint8_t column, uint8_t page) {
+static void oled_draw_text(const char *text, uint8_t column, uint8_t row) {
   while (*text != '\0' && column < 123) {
-    const uint8_t *glyph = oled_glyph(*text++);
-    for (uint8_t index = 0; index < 5 && column + index < 128; index++) {
-      oled_framebuffer[(page * 128) + column + index] = glyph[index];
-    }
+    oled_draw_glyph_row(oled_glyph(*text++), column, row);
     column += 6;
   }
 }
 
-// Dibuja texto continuo admitiendo CR/LF y salto automatico de pagina.
-// Se utiliza para mensajes de estado que pueden ocupar varias lineas y deja
-// de escribir cuando alcanza las ocho paginas del panel de 64 pixeles.
-static void oled_draw_wrapped_text(const char *text, uint8_t page) {
+// Dibuja texto continuo admitiendo CR/LF y salto automatico de linea cada
+// 10 px. Se utiliza para mensajes de estado que pueden ocupar varias lineas y
+// deja de escribir cuando se sale de los 64 pixeles de alto del panel.
+static void oled_draw_wrapped_text(const char *text, uint8_t row) {
   uint8_t column = 0;
-  while (*text != '\0' && page < 8) {
+  while (*text != '\0' && row < 64) {
     if (*text == '\r') {
       text++;
       continue;
@@ -123,18 +135,15 @@ static void oled_draw_wrapped_text(const char *text, uint8_t page) {
     if (*text == '\n') {
       text++;
       column = 0;
-      page++;
+      row += 11;
       continue;
     }
 
-    const uint8_t *glyph = oled_glyph(*text++);
-    for (uint8_t index = 0; index < 5 && column + index < 128; index++) {
-      oled_framebuffer[(page * 128) + column + index] = glyph[index];
-    }
+    oled_draw_glyph_row(oled_glyph(*text++), column, row);
     column += 6;
     if (column >= 126) {
       column = 0;
-      page++;
+      row += 11;
     }
   }
 }
@@ -155,7 +164,7 @@ static void oled_draw_battery_line(void) {
   if (oled_tara_valid) {
     char tara_text[22];
     snprintf(tara_text, sizeof(tara_text), "TARA = %.0f %%", oled_tara_percent);
-    oled_draw_text(tara_text, 0, 2);
+    oled_draw_text(tara_text, 0, 11);
   }
 }
 
@@ -174,12 +183,12 @@ static void oled_draw_firmware_line(void) {
   oled_draw_text(firmware_text, column, 0);
 }
 
-// Anexa un caracter a la segunda linea de la vista previa del loop.
-// El area reservada comienza en el indice 22 porque los primeros 22 bytes
-// contienen la linea anterior mostrada en la pantalla.
+// Anexa un caracter a la cuarta linea (la que se esta formando) de la vista
+// previa del loop. Las tres lineas anteriores ya quedaron fijadas al hacer
+// scroll, por eso la escritura siempre ocurre en el ultimo cuarto del buffer.
 static void oled_loop_append_char(char character) {
   if (oled_loop_preview_len < 21) {
-    oled_loop_preview[22 + oled_loop_preview_len++] = character;
+    oled_loop_preview[66 + oled_loop_preview_len++] = character;
   }
 }
 
@@ -204,7 +213,7 @@ static void oled_loop_compact_line(void) {
   bool in_number = false;
   bool pending_space = false;
 
-  for (size_t index = 22; index < 44 && oled_loop_preview[index] != '\0'; index++) {
+  for (size_t index = 66; index < 88 && oled_loop_preview[index] != '\0'; index++) {
     char character = oled_loop_preview[index];
     if (character >= '0' && character <= '9') {
       if (!in_number && number_count >= 5) {
@@ -230,7 +239,7 @@ static void oled_loop_compact_line(void) {
     }
   }
 
-  memcpy(oled_loop_preview + 22, compact_line, sizeof(compact_line));
+  memcpy(oled_loop_preview + 66, compact_line, sizeof(compact_line));
   oled_loop_preview_len = compact_len;
 }
 
@@ -244,18 +253,20 @@ static void oled_render_frame(void) {
   }
   oled_draw_firmware_line();
   if (oled_status_active) {
-    oled_draw_text(oled_status_title, 0, 2);
-    oled_draw_wrapped_text(oled_status_message, 4);
+    oled_draw_text(oled_status_title, 0, 11);
+    oled_draw_wrapped_text(oled_status_message, 22);
   } else if (!oled_loop_preview_active) {
-    oled_draw_wrapped_text(oled_frame_text, 4);
+    oled_draw_wrapped_text(oled_frame_text, 22);
   }
   if (oled_loop_preview_active) {
-    oled_draw_text(oled_loop_preview, 0, 4);
-    oled_draw_text(oled_loop_preview + 22, 0, 5);
+    oled_draw_text(oled_loop_preview, 0, 22);
+    oled_draw_text(oled_loop_preview + 22, 0, 33);
+    oled_draw_text(oled_loop_preview + 44, 0, 44);
+    oled_draw_text(oled_loop_preview + 66, 0, 55);
   }
   if (oled_uart_preview_active) {
-    oled_draw_text(oled_uart_preview, 0, 6);
-    oled_draw_text(oled_uart_preview + 22, 0, 7);
+    oled_draw_text(oled_uart_preview, 0, 44);
+    oled_draw_text(oled_uart_preview + 22, 0, 55);
   }
   ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(oled_panel, 0, 0, 128, 64, oled_framebuffer));
 }
@@ -427,6 +438,7 @@ void hardware_oled_clear_uart_preview(void) {
   oled_loop_preview_active = false;
   oled_loop_preview_len = 0;
   oled_loop_preview[0] = '\0';
+  oled_loop_pending_shift = false;
   oled_render_frame();
 }
 
@@ -446,18 +458,25 @@ void hardware_oled_update_loop_preview(const uint8_t *data, size_t len) {
     if (character == '\n') {
       oled_loop_finish_number();
       oled_loop_compact_line();
-      memcpy(oled_loop_preview, oled_loop_preview + 22, 22);
-      memset(oled_loop_preview + 22, 0, 22);
-      oled_loop_preview_len = 0;
+      oled_loop_pending_shift = true;
       continue;
     }
     if ((unsigned char)character < 0x20 || (unsigned char)character > 0x7E) {
       continue;
     }
 
+    // La linea recien cerrada permanece visible hasta que llega el primer
+    // caracter de la siguiente; recien ahi se hace scroll hacia arriba.
+    if (oled_loop_pending_shift) {
+      memmove(oled_loop_preview, oled_loop_preview + 22, 66);
+      memset(oled_loop_preview + 66, 0, 22);
+      oled_loop_preview_len = 0;
+      oled_loop_pending_shift = false;
+    }
+
     if (character == ' ') {
       oled_loop_finish_number();
-      if (oled_loop_preview_len == 0 || oled_loop_preview[22 + oled_loop_preview_len - 1] == ' ') {
+      if (oled_loop_preview_len == 0 || oled_loop_preview[66 + oled_loop_preview_len - 1] == ' ') {
         continue;
       }
       oled_loop_append_char(' ');
@@ -482,8 +501,10 @@ void hardware_oled_update_loop_preview(const uint8_t *data, size_t len) {
     oled_loop_append_char(character);
   }
 
-  oled_loop_finish_number();
-  oled_loop_compact_line();
+  if (!oled_loop_pending_shift) {
+    oled_loop_finish_number();
+    oled_loop_compact_line();
+  }
   oled_loop_preview[21] = '\0';
   oled_loop_preview_active = true;
   oled_render_frame();
