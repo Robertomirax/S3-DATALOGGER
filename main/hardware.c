@@ -37,10 +37,13 @@ static bool oled_tara_valid = false;
 static char oled_frame_text[128];
 static char oled_status_title[64];
 static char oled_status_message[128];
+static char oled_client_line[32];
+static bool oled_client_line_active = false;
+static bool oled_client_missing = false;
 static char oled_uart_preview[44];
 static size_t oled_uart_preview_len = 0;
 static bool oled_uart_preview_active = false;
-static char oled_loop_preview[88];
+static char oled_loop_preview[66];
 static size_t oled_loop_preview_len = 0;
 static bool oled_loop_number_started = false;
 static bool oled_loop_pending_zero = false;
@@ -115,10 +118,39 @@ static void oled_draw_glyph_row(const uint8_t *glyph, uint8_t column, uint8_t ro
 // Dibuja una cadena en la fila de pixeles indicada del framebuffer del OLED.
 // Cada caracter ocupa cinco columnas mas una columna de separacion. La rutina
 // limita la escritura al ancho de 128 pixeles para proteger el framebuffer.
+static void trim_left_spaces(char *text) {
+  if (text == NULL) {
+    return;
+  }
+
+  size_t index = 0;
+  while (text[index] == ' ' || text[index] == '\t' || text[index] == '\r' || text[index] == '\n') {
+    index++;
+  }
+
+  if ((unsigned char)text[index] == 0xEF && (unsigned char)text[index + 1] == 0xBB &&
+      (unsigned char)text[index + 2] == 0xBF) {
+    index += 3;
+  }
+
+  if (index > 0) {
+    memmove(text, text + index, strlen(text + index) + 1);
+  }
+}
+
 static void oled_draw_text(const char *text, uint8_t column, uint8_t row) {
-  while (*text != '\0' && column < 123) {
-    oled_draw_glyph_row(oled_glyph(*text++), column, row);
-    column += 6;
+  if (text == NULL) {
+    return;
+  }
+
+  while (*text != '\0' && (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n')) {
+    text++;
+  }
+
+  uint8_t x = column;
+  while (*text != '\0' && x < 128) {
+    oled_draw_glyph_row(oled_glyph(*text++), x, row);
+    x += 6;
   }
 }
 
@@ -159,12 +191,12 @@ static void oled_draw_battery_line(void) {
   } else {
     snprintf(battery_text, sizeof(battery_text), "BAT: -- V");
   }
-  oled_draw_text(battery_text, 0, 0);
+  oled_draw_text(battery_text, 0, 11);
 
   if (oled_tara_valid) {
     char tara_text[22];
     snprintf(tara_text, sizeof(tara_text), "TARA = %.0f %%", oled_tara_percent);
-    oled_draw_text(tara_text, 0, 11);
+    oled_draw_text(tara_text, 0, 22);
   }
 }
 
@@ -180,15 +212,15 @@ static void oled_draw_firmware_line(void) {
 
   int firmware_width = firmware_length * 6;
   uint8_t column = firmware_width < 128 ? (uint8_t)(128 - firmware_width) : 0;
-  oled_draw_text(firmware_text, column, 0);
+  oled_draw_text(firmware_text, column, 11);
 }
 
-// Anexa un caracter a la cuarta linea (la que se esta formando) de la vista
-// previa del loop. Las tres lineas anteriores ya quedaron fijadas al hacer
-// scroll, por eso la escritura siempre ocurre en el ultimo cuarto del buffer.
+// Anexa un caracter a la tercera linea (la que se esta formando) de la vista
+// previa del loop. Las dos lineas anteriores ya quedaron fijadas al hacer
+// scroll, por eso la escritura siempre ocurre en el ultimo tercio del buffer.
 static void oled_loop_append_char(char character) {
   if (oled_loop_preview_len < 21) {
-    oled_loop_preview[66 + oled_loop_preview_len++] = character;
+    oled_loop_preview[44 + oled_loop_preview_len++] = character;
   }
 }
 
@@ -213,7 +245,7 @@ static void oled_loop_compact_line(void) {
   bool in_number = false;
   bool pending_space = false;
 
-  for (size_t index = 66; index < 88 && oled_loop_preview[index] != '\0'; index++) {
+  for (size_t index = 44; index < 66 && oled_loop_preview[index] != '\0'; index++) {
     char character = oled_loop_preview[index];
     if (character >= '0' && character <= '9') {
       if (!in_number && number_count >= 5) {
@@ -239,7 +271,7 @@ static void oled_loop_compact_line(void) {
     }
   }
 
-  memcpy(oled_loop_preview + 66, compact_line, sizeof(compact_line));
+  memcpy(oled_loop_preview + 44, compact_line, sizeof(compact_line));
   oled_loop_preview_len = compact_len;
 }
 
@@ -248,21 +280,25 @@ static void oled_loop_compact_line(void) {
 // terminado al controlador SSD1306 en una sola operacion.
 static void oled_render_frame(void) {
   memset(oled_framebuffer, 0, sizeof(oled_framebuffer));
+
+  if (oled_client_line_active) {
+    oled_draw_text(oled_client_line, 0, 0);
+  }
+
   if (oled_battery_visible) {
     oled_draw_battery_line();
   }
   oled_draw_firmware_line();
   if (oled_status_active) {
-    oled_draw_text(oled_status_title, 0, 11);
-    oled_draw_wrapped_text(oled_status_message, 22);
+    oled_draw_text(oled_status_title, 0, 22);
+    oled_draw_wrapped_text(oled_status_message, 33);
   } else if (!oled_loop_preview_active) {
-    oled_draw_wrapped_text(oled_frame_text, 22);
+    oled_draw_wrapped_text(oled_frame_text, 33);
   }
   if (oled_loop_preview_active) {
-    oled_draw_text(oled_loop_preview, 0, 22);
-    oled_draw_text(oled_loop_preview + 22, 0, 33);
-    oled_draw_text(oled_loop_preview + 44, 0, 44);
-    oled_draw_text(oled_loop_preview + 66, 0, 55);
+    oled_draw_text(oled_loop_preview, 0, 33);
+    oled_draw_text(oled_loop_preview + 22, 0, 44);
+    oled_draw_text(oled_loop_preview + 44, 0, 55);
   }
   if (oled_uart_preview_active) {
     oled_draw_text(oled_uart_preview, 0, 44);
@@ -378,6 +414,33 @@ void hardware_oled_show_frame(const char *frame) {
   oled_render_frame();
 }
 
+void hardware_oled_show_client_line(const char *line) {
+  if (oled_panel == NULL || line == NULL) {
+    return;
+  }
+
+  char cleaned[32] = {0};
+  snprintf(cleaned, sizeof(cleaned), "%.31s", line);
+  trim_left_spaces(cleaned);
+
+  snprintf(oled_client_line, sizeof(oled_client_line), "%s", cleaned);
+  oled_client_line_active = true;
+  oled_client_missing = false;
+  //ESP_LOGI("OLED", "Mostrando linea de cliente:-%s-", cleaned);
+  oled_render_frame();
+}
+
+void hardware_oled_show_client_missing(void) {
+  if (oled_panel == NULL) {
+    return;
+  }
+
+  snprintf(oled_client_line, sizeof(oled_client_line), "FALTAN DATOS CLIENTE");
+  oled_client_line_active = true;
+  oled_client_missing = true;
+  oled_render_frame();
+}
+
 void hardware_oled_update_uart_preview(const uint8_t *data, size_t len) {
   // Alimenta la vista previa de la cabecera UART antes de iniciar el loop.
   // Filtra controles, normaliza tabuladores y conserva solo las dos ultimas
@@ -468,15 +531,15 @@ void hardware_oled_update_loop_preview(const uint8_t *data, size_t len) {
     // La linea recien cerrada permanece visible hasta que llega el primer
     // caracter de la siguiente; recien ahi se hace scroll hacia arriba.
     if (oled_loop_pending_shift) {
-      memmove(oled_loop_preview, oled_loop_preview + 22, 66);
-      memset(oled_loop_preview + 66, 0, 22);
+      memmove(oled_loop_preview, oled_loop_preview + 22, 44);
+      memset(oled_loop_preview + 44, 0, 22);
       oled_loop_preview_len = 0;
       oled_loop_pending_shift = false;
     }
 
     if (character == ' ') {
       oled_loop_finish_number();
-      if (oled_loop_preview_len == 0 || oled_loop_preview[66 + oled_loop_preview_len - 1] == ' ') {
+      if (oled_loop_preview_len == 0 || oled_loop_preview[44 + oled_loop_preview_len - 1] == ' ') {
         continue;
       }
       oled_loop_append_char(' ');

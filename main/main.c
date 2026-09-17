@@ -349,6 +349,149 @@ static bool alerta_tecnologias_recibida(const char *stream) {
   return version_start != NULL;
 }
 
+static void quitar_espacios_izquierda(char *text) {
+  if (text == NULL) {
+    return;
+  }
+
+  size_t index = 0;
+  while (text[index] == ' ' || text[index] == '\t' || text[index] == '\r' || text[index] == '\n') {
+    index++;
+  }
+
+  if (index > 0) {
+    memmove(text, text + index, strlen(text + index) + 1);
+  }
+}
+
+static bool validar_linea_cliente(const char *line) {
+  if (line == NULL)
+    return false;
+
+  char normalized[64];
+  snprintf(normalized, sizeof(normalized), "%.63s", line);
+  quitar_espacios_izquierda(normalized);
+
+  const unsigned char *p = (const unsigned char *)normalized;
+  while (*p != '\0' && isspace(*p)) {
+    p++;
+  }
+
+  if (*p == 0xEF && p[1] == 0xBB && p[2] == 0xBF) {
+    p += 3;
+  }
+
+  if (strncmp((const char *)p, "C:", 2) != 0) {
+    ESP_LOGW(TAG, "Fallo en prefijo C: en '%s' (primer byte=%02X)", line, (unsigned int)p[0]);
+    return false;
+  }
+  p += 2;
+
+  char c_value[9] = {0};
+  size_t c_len = 0;
+  while (*p != '\0' && !isspace((unsigned char)*p) && c_len < sizeof(c_value) - 1) {
+    unsigned char ch = (unsigned char)*p;
+    if (!(isalnum(ch))) {
+      ESP_LOGW(TAG, "Caracter no alfanumerico en C: '%s' (caracter=%c)", line, ch);
+      return false;
+    }
+    c_value[c_len++] = (char)ch;
+    p++;
+  }
+  c_value[c_len] = '\0';
+  if (c_len == 0 || c_len > 8) {
+    ESP_LOGW(TAG, "Longitud invalida de C: '%s' (%zu)", line, c_len);
+    return false;
+  }
+
+  if (p[0] != ' ' || p[1] != 'T' || p[2] != ':') {
+    ESP_LOGW(TAG, "No hay un espacio y prefijo T: despues de C: '%s' (siguientes=%02X %02X %02X)", line, (unsigned char)p[0], (unsigned char)p[1], (unsigned char)p[2]);
+    return false;
+  }
+  p += 1;
+
+  if (strncmp((const char *)p, "T:", 2) != 0) {
+    ESP_LOGW(TAG, "Fallo en prefijo T: en '%s'", line);
+    return false;
+  }
+  p += 2;
+
+  char t_value[9] = {0};
+  size_t t_len = 0;
+  while (*p != '\0' && !isspace((unsigned char)*p) && t_len < sizeof(t_value) - 1) {
+    unsigned char ch = (unsigned char)*p;
+    if (!(isalnum(ch))) {
+      ESP_LOGW(TAG, "Caracter no alfanumerico en T: '%s' (caracter=%c)", line, ch);
+      return false;
+    }
+    t_value[t_len++] = (char)ch;
+    p++;
+  }
+  t_value[t_len] = '\0';
+  if (t_len == 0 || t_len > 8) {
+    ESP_LOGW(TAG, "Longitud invalida de T: '%s' (%zu)", line, t_len);
+    return false;
+  }
+
+  while (*p != '\0' && isspace((unsigned char)*p)) {
+    p++;
+  }
+
+  if (*p != '\0') {
+    ESP_LOGW(TAG, "Caracteres extra despues de T: '%s'", line);
+    return false;
+  }
+
+  ESP_LOGI(TAG, "Cliente validado: C='%s' T='%s'", c_value, t_value);
+  return true;
+}
+
+static bool cargar_linea_cliente_desde_log(void) {
+  FILE *file = fopen(log_path, "r");
+  if (file == NULL) {
+    ESP_LOGE(TAG, "No se pudo abrir %s para leer la linea del cliente.", log_path);
+    hardware_oled_show_client_missing();
+    return false;
+  }
+
+  char line[64];
+  bool encontrado = false;
+  while (fgets(line, sizeof(line), file) != NULL) {
+    size_t len = strlen(line);
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' || line[len - 1] == ' ' || line[len - 1] == '\t')) {
+      line[--len] = '\0';
+    }
+
+    if (line[0] == '\0') {
+      continue;
+    }
+
+    ESP_LOGI(TAG, "Linea leida desde %s: '%s'", log_path, line);
+    encontrado = true;
+
+    if (validar_linea_cliente(line)) {
+      fclose(file);
+
+      char client_display[32];
+      snprintf(client_display, sizeof(client_display), "%.31s", line);
+      quitar_espacios_izquierda(client_display);
+
+      hardware_oled_show_client_line(client_display);
+      ESP_LOGI(TAG, "Linea del cliente valida: '%s'", client_display);
+      return true;
+    }
+
+    ESP_LOGW(TAG, "Linea del cliente invalida: '%s'", line);
+  }
+
+  fclose(file);
+  if (!encontrado) {
+    ESP_LOGW(TAG, "No se encontraron lineas en %s para validar el cliente.", log_path);
+  }
+  hardware_oled_show_client_missing();
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Procesador byte a byte
 // ---------------------------------------------------------------------------
@@ -914,6 +1057,7 @@ static void rx_task(void *arg) {
 
   char overlap_buf[64] = {0};
   size_t overlap_len = 0;
+  bool cliente_datos_validos = false;
 
   while (!modo_usb) {
     int rxBytes = uart_read_bytes(UART_PORT_NUM, data, UART_BUF_SIZE, pdMS_TO_TICKS(100));
@@ -931,17 +1075,31 @@ static void rx_task(void *arg) {
       memcpy(stream_buf + overlap_len, data, rxBytes);
       stream_buf[total_stream_len] = '\0';
 
+      if (alerta_tecnologias_mostrada && !cliente_datos_validos) {
+        hardware_oled_show_client_missing();
+        overlap_len = 0;
+        memset(overlap_buf, 0, sizeof(overlap_buf));
+        ignorar_grabacion = true;
+        continue;
+      }
+
       // Verificar si se ha recibido la cabecera de "Alert Technologies".
       // El aviso permanece hasta que comienza el procesamiento de tramas.
       if (!alerta_tecnologias_mostrada && alerta_tecnologias_recibida(stream_buf)) {
-        hardware_oled_show_message("CABECERA RECIBIDA\n\r", "ESPERANDO TARADO");
         alerta_tecnologias_mostrada = true;
         cabecera_recibida = true;
+        cliente_datos_validos = cargar_linea_cliente_desde_log();
+        if (!cliente_datos_validos) {
+          ESP_LOGE(TAG, "FALTAN LOS DATOS DEL CLIENTE en %s; no se registraran los datos recibidos.", log_path);
+          hardware_oled_show_client_missing();
+          overlap_len = 0;
+          memset(overlap_buf, 0, sizeof(overlap_buf));
+          ignorar_grabacion = true;
+          estado_grabado = 0;
+          continue;
+        }
+        hardware_oled_show_message("CABECERA RECIBIDA\n\r", "ESPERANDO TARADO");
         ESP_LOGI(TAG, "CABECERA DE CELDA RECIBIDA\n\rESPERANDO TARADO");
-      }
-
-      if (alerta_tecnologias_mostrada && estado_grabado == 0) {
-        hardware_oled_update_uart_preview(data, rxBytes);
       }
 
       // 1. Manejo de Comandos RS-232

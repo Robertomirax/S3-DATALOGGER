@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define FIRM 41 // Version del firmware
+#define FIRM 44 // Version del firmware
 
 // --- CONFIGURACIÓN UART / MAX3232 ---
 // El puerto UART_1 se usa para la comunicación con la celda de carga.
@@ -62,6 +62,12 @@ void hardware_oled_show_tara(float tara_percent);
 
 // Muestra el contenido de la última trama recibida debajo de la batería.
 void hardware_oled_show_frame(const char *frame);
+
+// Muestra la línea del cliente en la primera fila del OLED y la conserva.
+void hardware_oled_show_client_line(const char *line);
+
+// Muestra el aviso cuando faltan los datos del cliente en el archivo de log.
+void hardware_oled_show_client_missing(void);
 
 // Muestra los últimos caracteres recibidos por UART en la última línea.
 void hardware_oled_update_uart_preview(const uint8_t *data, size_t len);
