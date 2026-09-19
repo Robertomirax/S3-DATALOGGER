@@ -23,6 +23,129 @@ static const char *TAG_FLASH = "FLASH_WRITER";
 static const char *log_path = "/archivos/log_uart.txt";
 static const char *update_path = "/archivos/S3-DATALOGGER.bin";
 
+static bool flush_pending_log(void);
+static bool validar_linea_cliente(const char *line);
+
+static bool log_read_first_line_from_file(const char *path, char *out, size_t out_len) {
+  if (path == NULL || out == NULL || out_len == 0) {
+    return false;
+  }
+
+  FILE *file = fopen(path, "rb");
+  if (file == NULL) {
+    return false;
+  }
+
+  char raw[128];
+  size_t bytes_read = fread(raw, 1, sizeof(raw) - 1, file);
+  fclose(file);
+
+  if (bytes_read == 0) {
+    return false;
+  }
+
+  raw[bytes_read] = '\0';
+  char *line_end = strpbrk(raw, "\r\n");
+  if (line_end != NULL) {
+    *line_end = '\0';
+  }
+
+  snprintf(out, out_len, "%s", raw);
+  return true;
+}
+
+static bool log_file_has_protected_client_line(const char *path) {
+  if (path == NULL) {
+    return false;
+  }
+
+  char first_line[128];
+  if (!log_read_first_line_from_file(path, first_line, sizeof(first_line))) {
+    return false;
+  }
+
+  return validar_linea_cliente(first_line);
+}
+
+static void log_invert_bytes(uint8_t *data, size_t len) {
+  if (data == NULL) {
+    return;
+  }
+
+  for (size_t i = 0; i < len; i++) {
+    data[i] = (uint8_t)~data[i];
+  }
+}
+
+static bool log_write_inverted(FILE *file, const uint8_t *data, size_t len) {
+  if (file == NULL || data == NULL || len == 0) {
+    return true;
+  }
+
+  uint8_t *encoded = (uint8_t *)malloc(len);
+  if (encoded == NULL) {
+    return false;
+  }
+
+  memcpy(encoded, data, len);
+  log_invert_bytes(encoded, len);
+  size_t written = fwrite(encoded, 1, len, file);
+  free(encoded);
+  return written == len;
+}
+
+static void log_dump_plain_text(const uint8_t *data, size_t len) {
+  if (data == NULL || len == 0) {
+    return;
+  }
+
+  char preview[129];
+  size_t offset = 0;
+  while (offset < len) {
+    size_t chunk_len = len - offset;
+    if (chunk_len > 64) {
+      chunk_len = 64;
+    }
+
+    size_t out = 0;
+    for (size_t i = 0; i < chunk_len && out < sizeof(preview) - 1; i++) {
+      uint8_t value = data[offset + i];
+      if (value == '\r') {
+        preview[out++] = '\\';
+        if (out < sizeof(preview) - 1) {
+          preview[out++] = 'r';
+        }
+      } else if (value == '\n') {
+        preview[out++] = '\\';
+        if (out < sizeof(preview) - 1) {
+          preview[out++] = 'n';
+        }
+      } else if (value >= 0x20 && value <= 0x7E) {
+        preview[out++] = (char)value;
+      } else {
+        preview[out++] = '.';
+      }
+    }
+
+    preview[out] = '\0';
+    ESP_LOGI(TAG_FLASH, "Datos escritos [%u..%u]: %s",
+             (unsigned int)offset,
+             (unsigned int)(offset + chunk_len - 1),
+             preview);
+    offset += chunk_len;
+  }
+}
+
+static size_t log_read_inverted(FILE *file, uint8_t *buffer, size_t max_len) {
+  if (file == NULL || buffer == NULL || max_len == 0) {
+    return 0;
+  }
+
+  size_t bytes_read = fread(buffer, 1, max_len, file);
+  log_invert_bytes(buffer, bytes_read);
+  return bytes_read;
+}
+
 // static const char DL_HEADER1[] = "\x55\x55\x55\x55\x55\x55\x55";
 static const char DL_HEADER2[] = "\r\n\r\nAlert Technologies\r\nDATALOGGER "
                                  "VER1.04\r\n\nMemory Used...08%\r\n";
@@ -447,41 +570,43 @@ static bool validar_linea_cliente(const char *line) {
 }
 
 static bool cargar_linea_cliente_desde_log(void) {
+  if (ring_buffer_get_count() > 0) {
+    flush_pending_log();
+  }
+
   FILE *file = fopen(log_path, "r");
   if (file == NULL) {
     ESP_LOGE(TAG, "No se pudo abrir %s para leer la linea del cliente.", log_path);
     hardware_oled_show_client_missing();
     return false;
   }
-
-  char line[64];
   bool encontrado = false;
+  char line[128];
   while (fgets(line, sizeof(line), file) != NULL) {
     size_t len = strlen(line);
     while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' || line[len - 1] == ' ' || line[len - 1] == '\t')) {
       line[--len] = '\0';
     }
 
-    if (line[0] == '\0') {
-      continue;
+    if (line[0] != '\0') {
+      ESP_LOGI(TAG, "LINEA CRUDA LEIDA desde %s: '%s'", log_path, line);
+      ESP_LOGI(TAG, "Linea leida desde %s: '%s'", log_path, line);
+      encontrado = true;
+
+      if (validar_linea_cliente(line)) {
+        char client_display[32];
+        snprintf(client_display, sizeof(client_display), "%.31s", line);
+        quitar_espacios_izquierda(client_display);
+
+        hardware_oled_show_client_line(client_display);
+        ESP_LOGI(TAG, "Linea del cliente valida: '%s'", client_display);
+        fclose(file);
+        return true;
+      }
+
+      ESP_LOGW(TAG, "Linea del cliente invalida: '%s'", line);
     }
 
-    ESP_LOGI(TAG, "Linea leida desde %s: '%s'", log_path, line);
-    encontrado = true;
-
-    if (validar_linea_cliente(line)) {
-      fclose(file);
-
-      char client_display[32];
-      snprintf(client_display, sizeof(client_display), "%.31s", line);
-      quitar_espacios_izquierda(client_display);
-
-      hardware_oled_show_client_line(client_display);
-      ESP_LOGI(TAG, "Linea del cliente valida: '%s'", client_display);
-      return true;
-    }
-
-    ESP_LOGW(TAG, "Linea del cliente invalida: '%s'", line);
   }
 
   fclose(file);
@@ -645,18 +770,17 @@ static void flash_writer_task(void *arg) {
               break;
             }
 
-            size_t bytes_written = fwrite(write_buf, 1, bytes_to_read, f);
-            if (bytes_written != bytes_to_read) {
-              ESP_LOGE(TAG_FLASH, "Error escribiendo log: %u/%u bytes", (unsigned int)bytes_written, (unsigned int)bytes_to_read);
+            if (!log_write_inverted(f, write_buf, bytes_to_read)) {
+              ESP_LOGE(TAG_FLASH, "Error escribiendo log: %u bytes", (unsigned int)bytes_to_read);
               if (ferror(f)) {
                 ESP_LOGE(TAG_FLASH, "Error del flujo de archivo: %d", errno);
               }
               break;
             }
 
-            ESP_LOGI(TAG_FLASH, "Grabado en flash (%u bytes): %.*s", (unsigned int)bytes_written, (int)bytes_written,
-                     (const char *)write_buf);
-            ring_buffer_drop(bytes_written);
+            log_dump_plain_text(write_buf, bytes_to_read);
+            ESP_LOGI(TAG_FLASH, "Grabado en flash con bits invertidos (%u bytes)", (unsigned int)bytes_to_read);
+            ring_buffer_drop(bytes_to_read);
           }
 
           if (fflush(f) != 0 || ferror(f)) {
@@ -695,7 +819,10 @@ static bool flush_pending_log(void) {
     if (file != NULL) {
       while (ring_buffer_get_count() > 0) {
         size_t bytes_to_read = ring_buffer_peek(write_buf, TEMP_WRITE_BUF_SIZE);
-        if (bytes_to_read == 0 || fwrite(write_buf, 1, bytes_to_read, file) != bytes_to_read) {
+        if (bytes_to_read == 0) {
+          break;
+        }
+        if (!log_write_inverted(file, write_buf, bytes_to_read)) {
           break;
         }
         ring_buffer_drop(bytes_to_read);
@@ -846,13 +973,20 @@ static void startup_mode_task(void *arg) {
 // No escribe datos; sirve como comprobacion temprana antes de crear tareas que
 // dependan del almacenamiento.
 static bool ensure_log_file(void) {
-  FILE *file = fopen(log_path, "a");
-  if (file == NULL) {
+  FILE *file = fopen(log_path, "rb");
+  if (file != NULL) {
+    fclose(file);
+    ESP_LOGI(TAG_FLASH, "Log existente conservado en texto plano: %s", log_path);
+    return true;
+  }
+
+  FILE *fresh = fopen(log_path, "a");
+  if (fresh == NULL) {
     ESP_LOGE(TAG_FLASH, "No se pudo crear o abrir %s: errno=%d", log_path, errno);
     return false;
   }
 
-  if (fclose(file) != 0) {
+  if (fclose(fresh) != 0) {
     ESP_LOGE(TAG_FLASH, "No se pudo cerrar %s: errno=%d", log_path, errno);
     return false;
   }
@@ -937,7 +1071,7 @@ static void battery_voltage_task(void *arg) {
   while (!modo_usb) {
     int battery_voltage_mv = hardware_read_battery_voltage_mv();
     if (!modo_usb && battery_voltage_mv >= 0) {
-      ESP_LOGI(TAG, "Voltaje de bateria: %d mV (%.2f V)", battery_voltage_mv, battery_voltage_mv / 1000.0f);
+     // ESP_LOGI(TAG, "Voltaje de bateria: %d mV (%.2f V)", battery_voltage_mv, battery_voltage_mv / 1000.0f);
       hardware_oled_show_battery(battery_voltage_mv);
       if (battery_voltage_mv < BATTERY_LOW_AMARILLO_MV && battery_voltage_mv >= BATTERY_LOW_ROJO_MV) {
         ESP_LOGW(TAG, "Bateria baja: aviso mostrado en OLED");
@@ -982,15 +1116,14 @@ static void tx_file_task(void *arg) {
         if (bytes_to_write == 0)
           break;
 
-        size_t bytes_written = fwrite(tx_buffer, 1, bytes_to_write, f);
-        if (bytes_written != bytes_to_write) {
-          ESP_LOGE(TAG, "Error guardando datos pendientes antes de transmitir.");
+        if (!log_write_inverted(f, tx_buffer, bytes_to_write)) {
+          ESP_LOGE(TAG, "Error escribiendo datos pendientes antes de transmitir.");
           if (ferror(f)) {
             ESP_LOGE(TAG, "Error del flujo de archivo: %d", errno);
           }
           break;
         }
-        ring_buffer_drop(bytes_written);
+        ring_buffer_drop(bytes_to_write);
       }
       fflush(f);
       fclose(f);
@@ -999,7 +1132,12 @@ static void tx_file_task(void *arg) {
     }
     if (f != NULL) {
       size_t bytes_read = 0;
-      while ((bytes_read = fread(tx_buffer, 1, UART_BUF_SIZE, f)) > 0) {
+      if (fgets((char *)tx_buffer, UART_BUF_SIZE, f) != NULL) {
+        bytes_read = strlen((char *)tx_buffer);
+        uart_write_bytes(UART_PORT_NUM, (const char *)tx_buffer, bytes_read);
+        uart_wait_tx_done(UART_PORT_NUM, pdMS_TO_TICKS(1000));
+      }
+      while ((bytes_read = log_read_inverted(f, tx_buffer, UART_BUF_SIZE)) > 0) {
         uart_write_bytes(UART_PORT_NUM, (const char *)tx_buffer, bytes_read);
         uart_wait_tx_done(UART_PORT_NUM, pdMS_TO_TICKS(1000));
       }
@@ -1114,17 +1252,22 @@ static void rx_task(void *arg) {
           }
         }
         if (resp == 'y' || resp == 'Y') {
-          uart_write_bytes(UART_PORT_NUM, "Self Diag ...Waiting\r\n", 22);
+          if (log_file_has_protected_client_line(log_path)) {
+            ESP_LOGW(TAG, "Se protege la primera linea del cliente y no se borra el archivo: %s", log_path);
+            uart_write_bytes(UART_PORT_NUM, "Client data protected\r\n", 23);
+          } else {
+            uart_write_bytes(UART_PORT_NUM, "Self Diag ...Waiting\r\n", 22);
 
-          if (xSemaphoreTake(file_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            FILE *f_clr = fopen(log_path, "w");
-            if (f_clr != NULL) {
-              fclose(f_clr);
-              ring_buffer_clear();
-              reset_capture_state();
-              uart_write_bytes(UART_PORT_NUM, "RAM test successful\r\n\r\nDone\r\n", 29);
+            if (xSemaphoreTake(file_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+              FILE *f_clr = fopen(log_path, "w");
+              if (f_clr != NULL) {
+                fclose(f_clr);
+                ring_buffer_clear();
+                reset_capture_state();
+                uart_write_bytes(UART_PORT_NUM, "RAM test successful\r\n\r\nDone\r\n", 29);
+              }
+              xSemaphoreGive(file_mutex);
             }
-            xSemaphoreGive(file_mutex);
           }
         }
         esperando_confirmacion = false;

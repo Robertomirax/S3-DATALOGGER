@@ -126,7 +126,7 @@ Después de cada reinicio, el firmware arranca en modo datalogger y espera hasta
 ## Actualización OTA desde pendrive
 
 1. Compila el firmware y genera `build/S3-DATALOGGER.bin`.
-2. Copia ese archivo al pendrive con el nombre `firmware.bin`.
+2. Copia ese archivo al pendrive .
 3. Expulsa la unidad desde Windows.
 4. Desconecta el cable USB-C.
 5. El sistema detecta la desconexión, valida la imagen y la instala en la OTA alternativa.
@@ -146,7 +146,7 @@ idf.py -p COM15 monitor
 - `SECUENCIA ACTIVA`: la primera trama de la celda fue detectada.
 - `TECNOLOGIA DETECTADA`: se recibió la cabecera del equipo.
 - `SIN DATOS UART`: no llegan datos durante más de 30 segundos.
-- `BAT: ... V`: voltaje de batería en la primera línea del OLED.
+- `BAT: ... V`: voltaje de batería en la segunda línea del OLED.
 - Las tramas procesadas se muestran debajo de la línea de batería.
 
 ## Formato del archivo de log
