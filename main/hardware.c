@@ -50,6 +50,10 @@ static bool oled_loop_pending_zero = false;
 static bool oled_loop_preview_active = false;
 static bool oled_loop_pending_shift = false;
 static bool oled_status_active = false;
+static bool oled_taring_active = false;
+static int oled_taring_pass = 0;
+static int oled_taring_ld_cell = 0;
+static int oled_taring_dac = 0;
 static bool usb_msc_active = false;
 static volatile bool usb_msc_detached = false;
 
@@ -292,6 +296,15 @@ static void oled_render_frame(void) {
   if (oled_status_active) {
     oled_draw_text(oled_status_title, 0, 22);
     oled_draw_wrapped_text(oled_status_message, 33);
+    if (oled_taring_active) {
+      char taring_header_line[22];
+      snprintf(taring_header_line, sizeof(taring_header_line), "PASS LDCELL  DAC");
+      oled_draw_text(taring_header_line, 0, 44);
+
+      char taring_values_line[22];
+      snprintf(taring_values_line, sizeof(taring_values_line), "%4d %5d %5d", oled_taring_pass, oled_taring_ld_cell, oled_taring_dac);
+      oled_draw_text(taring_values_line, 0, 55);
+    }
   } else if (!oled_loop_preview_active) {
     oled_draw_wrapped_text(oled_frame_text, 33);
   }
@@ -485,6 +498,27 @@ void hardware_oled_update_uart_preview(const uint8_t *data, size_t len) {
   oled_uart_preview[21] = '\0';
   oled_uart_preview_active = true;
   oled_render_frame();
+}
+
+void hardware_oled_show_taring(int pass_count, int ld_cell, int dac) {
+  // Refleja en pantalla la fila mas reciente de la tabla de tarado mientras
+  // el equipo sigue esperando la cabecera "Running:".
+  if (oled_panel == NULL) {
+    return;
+  }
+
+  oled_taring_active = true;
+  oled_taring_pass = pass_count;
+  oled_taring_ld_cell = ld_cell;
+  oled_taring_dac = dac;
+  oled_render_frame();
+}
+
+void hardware_oled_clear_taring(void) {
+  oled_taring_active = false;
+  if (oled_panel != NULL) {
+    oled_render_frame();
+  }
 }
 
 void hardware_oled_clear_uart_preview(void) {

@@ -22,50 +22,11 @@ static const char *TAG = "MAIN_APP";
 static const char *TAG_FLASH = "FLASH_WRITER";
 static const char *log_path = "/archivos/log_uart.txt";
 static const char *update_path = "/archivos/S3-DATALOGGER.bin";
+static const char DL_HEADER2[] = "\r\n\r\nAlert Technologies\r\nDATALOGGER "
+                                 "VER1.04\r\n\nMemory Used...08%\r\n";
 
 static bool flush_pending_log(void);
 static bool validar_linea_cliente(const char *line);
-
-static bool log_read_first_line_from_file(const char *path, char *out, size_t out_len) {
-  if (path == NULL || out == NULL || out_len == 0) {
-    return false;
-  }
-
-  FILE *file = fopen(path, "rb");
-  if (file == NULL) {
-    return false;
-  }
-
-  char raw[128];
-  size_t bytes_read = fread(raw, 1, sizeof(raw) - 1, file);
-  fclose(file);
-
-  if (bytes_read == 0) {
-    return false;
-  }
-
-  raw[bytes_read] = '\0';
-  char *line_end = strpbrk(raw, "\r\n");
-  if (line_end != NULL) {
-    *line_end = '\0';
-  }
-
-  snprintf(out, out_len, "%s", raw);
-  return true;
-}
-
-static bool log_file_has_protected_client_line(const char *path) {
-  if (path == NULL) {
-    return false;
-  }
-
-  char first_line[128];
-  if (!log_read_first_line_from_file(path, first_line, sizeof(first_line))) {
-    return false;
-  }
-
-  return validar_linea_cliente(first_line);
-}
 
 static void log_invert_bytes(uint8_t *data, size_t len) {
   if (data == NULL) {
@@ -135,20 +96,6 @@ static void log_dump_plain_text(const uint8_t *data, size_t len) {
     offset += chunk_len;
   }
 }
-
-static size_t log_read_inverted(FILE *file, uint8_t *buffer, size_t max_len) {
-  if (file == NULL || buffer == NULL || max_len == 0) {
-    return 0;
-  }
-
-  size_t bytes_read = fread(buffer, 1, max_len, file);
-  log_invert_bytes(buffer, bytes_read);
-  return bytes_read;
-}
-
-// static const char DL_HEADER1[] = "\x55\x55\x55\x55\x55\x55\x55";
-static const char DL_HEADER2[] = "\r\n\r\nAlert Technologies\r\nDATALOGGER "
-                                 "VER1.04\r\n\nMemory Used...08%\r\n";
 
 #define RING_BUF_SIZE (8 * 1024)   // Búfer circular de 8 KB en RAM
 #define FLASH_WRITE_THRESHOLD 2048 // Escribir a Flash al acumular 2 KB
@@ -278,18 +225,6 @@ static size_t ring_buffer_drop(size_t len) {
 // Descarta todos los bytes pendientes y reinicia los indices del ring buffer.
 // Se usa al confirmar el comando de autodiagnostico despues de truncar el
 // archivo, dejando RAM y almacenamiento persistente en el mismo punto.
-static void ring_buffer_clear(void) {
-  if (!ring_buffer_ready())
-    return;
-
-  if (xSemaphoreTake(rb.mutex, portMAX_DELAY) == pdTRUE) {
-    rb.head = 0;
-    rb.tail = 0;
-    rb.count = 0;
-    xSemaphoreGive(rb.mutex);
-  }
-}
-
 // Obtiene de forma segura la cantidad de bytes que aun esperan persistencia.
 // El valor se toma bajo mutex para que no quede a mitad de una escritura del
 // receptor o de una retirada realizada por otra tarea.
@@ -308,11 +243,8 @@ static size_t ring_buffer_get_count(void) {
 // ---------------------------------------------------------------------------
 // Variables Globales de Estado y UI
 // ---------------------------------------------------------------------------
-// Estas variables coordinan el flujo principal del sistema: comandos RS-232,
-// transmisión del log y activación de secuencia.
+// Estas variables coordinan la recepción de datos y la activación de secuencia.
 
-static volatile bool esperando_confirmacion = false;
-static volatile bool transmitiendo_archivo = false;
 static volatile bool secuencia_activa = false;
 static volatile bool cabecera_recibida = false;
 static volatile bool modo_usb = false;
@@ -406,6 +338,90 @@ static void procesar_running(const uint8_t *data, size_t len) {
         ESP_LOGW(TAG, "Running: no se recibio un valor numerico previo");
       }
       running_context_len = 0;
+    }
+  }
+}
+
+static const char taring_header[] =
+  "\"Taring load cell a:\"\r\n\"    pass\",\" ld cell\",\"     dac\"";
+static char taring_context[sizeof(taring_header)];
+static size_t taring_context_len = 0;
+static bool taring_filas_activas = false;
+static char taring_line[48];
+static size_t taring_line_len = 0;
+
+// Reinicia el detector de la tabla "Taring load cell a:" y oculta su fila
+// del OLED. Se usa al recibir una nueva cabecera y al comenzar el loop.
+static void reset_taring_state(void) {
+  taring_context_len = 0;
+  taring_filas_activas = false;
+  taring_line_len = 0;
+  hardware_oled_clear_taring();
+}
+
+// Detecta la tabla "Taring load cell a:" y muestra en el OLED la ultima fila
+// recibida (pass, ld cell, dac) mientras se espera el fin del tarado.
+//
+// Reutiliza el patron de ventana deslizante de `procesar_running` para
+// reconocer el encabezado aunque llegue partido entre bloques UART. Una vez
+// dentro de la tabla acumula cada linea y la interpreta como una fila de tres
+// valores separados por comas; una linea que no comienza con un digito
+// (linea en blanco o el encabezado de "Running:") cierra la tabla.
+static void procesar_taring(const uint8_t *data, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    char c = (char)data[i];
+
+    if (!taring_filas_activas) {
+      if (taring_context_len == sizeof(taring_context) - 1) {
+        memmove(taring_context, taring_context + 1, taring_context_len - 1);
+        taring_context_len--;
+      }
+      taring_context[taring_context_len++] = c;
+      taring_context[taring_context_len] = '\0';
+
+      if (strstr(taring_context, taring_header) != NULL) {
+        ESP_LOGI(TAG, "Cabecera de tarado detectada. Mostrando filas en OLED...");
+        taring_filas_activas = true;
+        taring_context_len = 0;
+        taring_line_len = 0;
+      }
+      continue;
+    }
+
+    if (c == '\r') {
+      continue;
+    }
+
+    if (c == '\n') {
+      taring_line[taring_line_len] = '\0';
+
+      size_t idx = 0;
+      while (taring_line[idx] == ' ' || taring_line[idx] == '\t') {
+        idx++;
+      }
+
+      if (taring_line[idx] == '\0') {
+        // Linea en blanco: puede ser el propio salto del encabezado o el
+        // separador antes de "Running:". No cierra la tabla por si sola.
+      } else if (!isdigit((unsigned char)taring_line[idx])) {
+        ESP_LOGI(TAG, "Fin de la tabla de tarado.");
+        taring_filas_activas = false;
+      } else {
+        int pass_count = 0, ld_cell = 0, dac = 0;
+        if (sscanf(taring_line + idx, "%d,%d,%d", &pass_count, &ld_cell, &dac) == 3) {
+          ESP_LOGI(TAG, "Fila de tarado: pass=%d ld_cell=%d dac=%d", pass_count, ld_cell, dac);
+          hardware_oled_show_taring(pass_count, ld_cell, dac);
+        } else {
+          ESP_LOGW(TAG, "Fila de tarado no reconocida: '%s'", taring_line + idx);
+        }
+      }
+
+      taring_line_len = 0;
+      continue;
+    }
+
+    if (taring_line_len < sizeof(taring_line) - 1) {
+      taring_line[taring_line_len++] = c;
     }
   }
 }
@@ -758,7 +774,7 @@ static void flash_writer_task(void *arg) {
     // Criterio de volcado: 2 KB acumulados O transcurridos 5 segundos
     bool should_write = (pending_bytes >= FLASH_WRITE_THRESHOLD) || (pending_bytes > 0 && elapsed >= pdMS_TO_TICKS(5000));
 
-    if (should_write && !transmitiendo_archivo) {
+    if (should_write) {
       if (file_mutex == NULL) {
         ESP_LOGE(TAG_FLASH, "Mutex de archivo no inicializado.");
       } else if (xSemaphoreTake(file_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
@@ -951,7 +967,6 @@ static void startup_mode_task(void *arg) {
   }
 
   ESP_LOGW(TAG, "No se recibio la cabecera en 5 segundos; cambiando a USB");
-  transmitiendo_archivo = true;
   modo_usb = true;
   if (flush_pending_log() && hardware_enter_usb_msc() == ESP_OK) {
     hardware_oled_hide_battery();
@@ -962,7 +977,6 @@ static void startup_mode_task(void *arg) {
     }
   } else {
     modo_usb = false;
-    transmitiendo_archivo = false;
     ESP_LOGE(TAG, "No se pudo cambiar automaticamente al modo USB");
   }
 
@@ -1087,85 +1101,10 @@ static void battery_voltage_task(void *arg) {
   vTaskDelete(NULL);
 }
 
-// Atiende el comando `send` y transmite el log completo por UART.
-// Primero vacia en el archivo los datos que aun estan en RAM, cambia a 4800
-// baudios para la transferencia y finalmente envia el comando de retorno a
-// 300 baudios, que es la velocidad normal de captura.
-static void tx_file_task(void *arg) {
-  uint8_t *tx_buffer = (uint8_t *)malloc(UART_BUF_SIZE);
-  if (tx_buffer == NULL) {
-    ESP_LOGE(TAG, "No se pudo reservar el buffer de transmision.");
-    transmitiendo_archivo = false;
-    vTaskDelete(NULL);
-    return;
-  }
-
-  vTaskDelay(pdMS_TO_TICKS(10000));
-
-  if (uart_set_baudrate(UART_PORT_NUM, 4800) == ESP_OK) {
-    ESP_LOGI(TAG, "Baudrate cambiado a 4800");
-  }
-
-  if (file_mutex == NULL) {
-    ESP_LOGE(TAG, "Mutex de archivo no inicializado para transmision.");
-  } else if (xSemaphoreTake(file_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
-    FILE *f = fopen(log_path, "a+");
-    if (f != NULL) {
-      while (ring_buffer_get_count() > 0) {
-        size_t bytes_to_write = ring_buffer_peek(tx_buffer, UART_BUF_SIZE);
-        if (bytes_to_write == 0)
-          break;
-
-        if (!log_write_inverted(f, tx_buffer, bytes_to_write)) {
-          ESP_LOGE(TAG, "Error escribiendo datos pendientes antes de transmitir.");
-          if (ferror(f)) {
-            ESP_LOGE(TAG, "Error del flujo de archivo: %d", errno);
-          }
-          break;
-        }
-        ring_buffer_drop(bytes_to_write);
-      }
-      fflush(f);
-      fclose(f);
-
-      f = fopen(log_path, "r");
-    }
-    if (f != NULL) {
-      size_t bytes_read = 0;
-      if (fgets((char *)tx_buffer, UART_BUF_SIZE, f) != NULL) {
-        bytes_read = strlen((char *)tx_buffer);
-        uart_write_bytes(UART_PORT_NUM, (const char *)tx_buffer, bytes_read);
-        uart_wait_tx_done(UART_PORT_NUM, pdMS_TO_TICKS(1000));
-      }
-      while ((bytes_read = log_read_inverted(f, tx_buffer, UART_BUF_SIZE)) > 0) {
-        uart_write_bytes(UART_PORT_NUM, (const char *)tx_buffer, bytes_read);
-        uart_wait_tx_done(UART_PORT_NUM, pdMS_TO_TICKS(1000));
-      }
-      if (ferror(f))
-        ESP_LOGE(TAG, "Error leyendo archivo log para transmision.");
-      fclose(f);
-    } else {
-      ESP_LOGE(TAG, "Error abriendo archivo log para lectura");
-    }
-    xSemaphoreGive(file_mutex);
-  }
-
-  const char *msg = "\r\n\r\nChangeBaud->300\r\n\r\n";
-  uart_write_bytes(UART_PORT_NUM, msg, strlen(msg));
-  if (uart_wait_tx_done(UART_PORT_NUM, pdMS_TO_TICKS(1500)) != ESP_OK)
-    ESP_LOGW(TAG, "Timeout esperando el mensaje de cambio de baudrate.");
-
-  uart_set_baudrate(UART_PORT_NUM, 300);
-
-  free(tx_buffer);
-  transmitiendo_archivo = false;
-  vTaskDelete(NULL);
-}
-
 // Tarea principal de recepcion UART y coordinacion del datalogger.
 // Conserva datos previos al loop, reconoce la cabecera de captura, atiende los
-// comandos `send` y `mtest`, mantiene solapamiento entre bloques y entrega el
-// flujo continuo a la maquina de estados. Libera sus buffers al cambiar a USB.
+// el flujo continuo a la maquina de estados y mantiene solapamiento entre
+// bloques UART. Libera sus buffers al cambiar a USB.
 static void rx_task(void *arg) {
   uint8_t *data = (uint8_t *)malloc(UART_BUF_SIZE);
   char *stream_buf = (char *)malloc(UART_BUF_SIZE + 64);
@@ -1203,9 +1142,8 @@ static void rx_task(void *arg) {
     if (rxBytes > 0) {
       ESP_LOGI(TAG, "UART RX: %d bytes", rxBytes);
       procesar_running(data, rxBytes);
+      procesar_taring(data, rxBytes);
 
-      // flag que evita que se guarde o procese el contenido si se está atendiendo
-      // un comando del usuario o una transmisión de datos desde la memoria.
       bool ignorar_grabacion = false;
       size_t total_stream_len = overlap_len + rxBytes;
 
@@ -1238,68 +1176,11 @@ static void rx_task(void *arg) {
         }
         hardware_oled_show_message("CABECERA RECIBIDA\n\r", "ESPERANDO TARADO");
         ESP_LOGI(TAG, "CABECERA DE CELDA RECIBIDA\n\rESPERANDO TARADO");
+        reset_taring_state();
       }
 
-      // 1. Manejo de Comandos RS-232
-      // Comprueba si el sistema está esperando una respuesta de confirmación
-      // para borrar RAM o ejecutar una operación controlada.
-      if (esperando_confirmacion) {
-        char resp = 0;
-        for (int i = 0; i < rxBytes; i++) {
-          if (data[i] == 'y' || data[i] == 'Y' || data[i] == 'n' || data[i] == 'N') {
-            resp = (char)data[i];
-            break;
-          }
-        }
-        if (resp == 'y' || resp == 'Y') {
-          if (log_file_has_protected_client_line(log_path)) {
-            ESP_LOGW(TAG, "Se protege la primera linea del cliente y no se borra el archivo: %s", log_path);
-            uart_write_bytes(UART_PORT_NUM, "Client data protected\r\n", 23);
-          } else {
-            uart_write_bytes(UART_PORT_NUM, "Self Diag ...Waiting\r\n", 22);
-
-            if (xSemaphoreTake(file_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-              FILE *f_clr = fopen(log_path, "w");
-              if (f_clr != NULL) {
-                fclose(f_clr);
-                ring_buffer_clear();
-                reset_capture_state();
-                uart_write_bytes(UART_PORT_NUM, "RAM test successful\r\n\r\nDone\r\n", 29);
-              }
-              xSemaphoreGive(file_mutex);
-            }
-          }
-        }
-        esperando_confirmacion = false;
-        ignorar_grabacion = true;
-        overlap_len = 0;
-        memset(overlap_buf, 0, sizeof(overlap_buf));
-
-      } else if (strstr(stream_buf, "send") != NULL) {
-        if (!transmitiendo_archivo) {
-          transmitiendo_archivo = true;
-          const char *cambio = "ChangeBaud->4800 in 10Sec\r\n";
-          uart_write_bytes(UART_PORT_NUM, cambio, strlen(cambio));
-          if (xTaskCreate(tx_file_task, "tx_file_task", 4096, NULL, 5, NULL) != pdPASS) {
-            transmitiendo_archivo = false;
-            ESP_LOGE(TAG, "No se pudo crear la tarea de transmision.");
-          }
-        }
-        ignorar_grabacion = true;
-        overlap_len = 0;
-        memset(overlap_buf, 0, sizeof(overlap_buf));
-
-      } else if (strstr(stream_buf, "mtest") != NULL) {
-        esperando_confirmacion = true;
-        const char *prompt = "Will clear data\r\nAre you sure? y/n  \r\n";
-        uart_write_bytes(UART_PORT_NUM, prompt, strlen(prompt));
-        ignorar_grabacion = true;
-        overlap_len = 0;
-        memset(overlap_buf, 0, sizeof(overlap_buf));
-      }
-
-      // 2. Almacenamiento y procesamiento de datos
-      if (!ignorar_grabacion && !transmitiendo_archivo) {
+      // Almacenamiento y procesamiento de datos
+      if (!ignorar_grabacion) {
         if (estado_grabado == 0) {
           char *match = (char *)memmem(stream_buf, total_stream_len, target, target_len);
 
@@ -1319,6 +1200,7 @@ static void rx_task(void *arg) {
             }
             estado_grabado = 2;
             hardware_oled_clear_uart_preview();
+            reset_taring_state();
             reset_capture_state();
 
             // Procesar el resto del buffer inmediatamente en la máquina de estados
@@ -1340,7 +1222,7 @@ static void rx_task(void *arg) {
       // 3. Mantenimiento del buffer de solapamiento
       // Conserva un tramo final del flujo para detectar coincidencias partidas
       // entre bloques UART consecutivos.
-      if (!ignorar_grabacion && !transmitiendo_archivo) {
+      if (!ignorar_grabacion) {
         if (total_stream_len >= (target_len - 1)) {
           overlap_len = target_len - 1;
           if (overlap_len > sizeof(overlap_buf)) {

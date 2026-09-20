@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define FIRM 44 // Version del firmware
+#define FIRM 46 // Version del firmware
 
 // --- CONFIGURACIÓN UART / MAX3232 ---
 // El puerto UART_1 se usa para la comunicación con la celda de carga.
@@ -77,6 +77,12 @@ void hardware_oled_clear_uart_preview(void);
 
 // Muestra en el OLED los datos originales recibidos durante el loop.
 void hardware_oled_update_loop_preview(const uint8_t *data, size_t len);
+
+// Muestra la fila actual de la tabla "Taring load cell a:" (pass, ld cell, dac).
+void hardware_oled_show_taring(int pass_count, int ld_cell, int dac);
+
+// Oculta la fila de tarado al terminar o abandonar esa tabla.
+void hardware_oled_clear_taring(void);
 
 // Inicializa la capa de almacenamiento y el resto de periféricos conectados.
 void hardware_init_all(void);
