@@ -1,15 +1,15 @@
 //-------------------------------- main.c --------------------------------
 
 #include "driver/uart.h"
-#include "esp_ota_ops.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "freertos/FreeRTOS.h" // IWYU pragma: keep
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "hardware.h"
+#include <ctype.h>
 #include <errno.h> // IWYU pragma: keep
 #include <stdbool.h>
-#include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -89,10 +89,7 @@ static void log_dump_plain_text(const uint8_t *data, size_t len) {
     }
 
     preview[out] = '\0';
-    ESP_LOGI(TAG_FLASH, "Datos escritos [%u..%u]: %s",
-             (unsigned int)offset,
-             (unsigned int)(offset + chunk_len - 1),
-             preview);
+    ESP_LOGI(TAG_FLASH, "Datos escritos [%u..%u]: %s", (unsigned int)offset, (unsigned int)(offset + chunk_len - 1), preview);
     offset += chunk_len;
   }
 }
@@ -281,8 +278,7 @@ static char ultimo_valor_numerico[32];
 static size_t ultimo_valor_len = 0;
 static char valor_numerico_actual[32];
 static size_t valor_numerico_len = 0;
-static const char running_header[] =
-  "\"Running:\"\r\n\"   seq #\",\"ld cella\",\"     dac\",\"    temp\",\"    tare\"";
+static const char running_header[] = "\"Running:\"\r\n\"   seq #\",\"ld cella\",\"     dac\",\"    temp\",\"    tare\"";
 static char running_context[sizeof(running_header)];
 static size_t running_context_len = 0;
 
@@ -312,8 +308,7 @@ static void procesar_running(const uint8_t *data, size_t len) {
   for (size_t i = 0; i < len; i++) {
     char c = (char)data[i];
 
-    if (isdigit((unsigned char)c) ||
-        ((c == '-' || c == '+' || c == '.') && valor_numerico_len == 0)) {
+    if (isdigit((unsigned char)c) || ((c == '-' || c == '+' || c == '.') && valor_numerico_len == 0)) {
       if (valor_numerico_len < sizeof(valor_numerico_actual) - 1)
         valor_numerico_actual[valor_numerico_len++] = c;
     } else {
@@ -342,8 +337,7 @@ static void procesar_running(const uint8_t *data, size_t len) {
   }
 }
 
-static const char taring_header[] =
-  "\"Taring load cell a:\"\r\n\"    pass\",\" ld cell\",\"     dac\"";
+static const char taring_header[] = "\"Taring load cell a:\"\r\n\"    pass\",\" ld cell\",\"     dac\"";
 static char taring_context[sizeof(taring_header)];
 static size_t taring_context_len = 0;
 static bool taring_filas_activas = false;
@@ -543,11 +537,13 @@ static bool validar_linea_cliente(const char *line) {
     return false;
   }
 
-  if (p[0] != ' ' || p[1] != 'T' || p[2] != ':') {
-    ESP_LOGW(TAG, "No hay un espacio y prefijo T: despues de C: '%s' (siguientes=%02X %02X %02X)", line, (unsigned char)p[0], (unsigned char)p[1], (unsigned char)p[2]);
+  if (!isspace((unsigned char)*p)) {
+    ESP_LOGW(TAG, "No hay separador y prefijo T: despues de C: '%s' (siguiente=%02X)", line, (unsigned char)*p);
     return false;
   }
-  p += 1;
+  while (*p != '\0' && isspace((unsigned char)*p)) {
+    p++;
+  }
 
   if (strncmp((const char *)p, "T:", 2) != 0) {
     ESP_LOGW(TAG, "Fallo en prefijo T: en '%s'", line);
@@ -590,42 +586,72 @@ static bool cargar_linea_cliente_desde_log(void) {
     flush_pending_log();
   }
 
-  FILE *file = fopen(log_path, "r");
+  // El log se guarda con los bits de cada byte invertidos; hay que decodificar
+  // cada bloque leido antes de poder interpretarlo como texto y detectar CRLF.
+  FILE *file = fopen(log_path, "rb");
   if (file == NULL) {
     ESP_LOGE(TAG, "No se pudo abrir %s para leer la linea del cliente.", log_path);
     hardware_oled_show_client_missing();
     return false;
   }
+
   bool encontrado = false;
+  bool valido = false;
   char line[128];
-  while (fgets(line, sizeof(line), file) != NULL) {
-    size_t len = strlen(line);
-    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' || line[len - 1] == ' ' || line[len - 1] == '\t')) {
-      line[--len] = '\0';
-    }
+  size_t line_len = 0;
+  uint8_t chunk[64];
+  size_t bytes_read;
 
-    if (line[0] != '\0') {
-      ESP_LOGI(TAG, "LINEA CRUDA LEIDA desde %s: '%s'", log_path, line);
-      ESP_LOGI(TAG, "Linea leida desde %s: '%s'", log_path, line);
-      encontrado = true;
+  while (!valido && (bytes_read = fread(chunk, 1, sizeof(chunk), file)) > 0) {
+    log_invert_bytes(chunk, bytes_read);
 
-      if (validar_linea_cliente(line)) {
-        char client_display[32];
-        snprintf(client_display, sizeof(client_display), "%.31s", line);
-        quitar_espacios_izquierda(client_display);
+    for (size_t i = 0; i < bytes_read && !valido; i++) {
+      char c = (char)chunk[i];
 
-        hardware_oled_show_client_line(client_display);
-        ESP_LOGI(TAG, "Linea del cliente valida: '%s'", client_display);
-        fclose(file);
-        return true;
+      if (c == '\n' || c == '\r') {
+        if (line_len == 0) {
+          continue;
+        }
+        while (line_len > 0 && (line[line_len - 1] == ' ' || line[line_len - 1] == '\t')) {
+          line_len--;
+        }
+        line[line_len] = '\0';
+
+        if (line_len == 0) {
+          continue;
+        }
+
+        ESP_LOGI(TAG, "LINEA CRUDA LEIDA desde %s: '%s'", log_path, line);
+        encontrado = true;
+
+        if (validar_linea_cliente(line)) {
+          char client_display[32];
+          snprintf(client_display, sizeof(client_display), "%.31s", line);
+          quitar_espacios_izquierda(client_display);
+
+          hardware_oled_show_client_line(client_display);
+          ESP_LOGI(TAG, "Linea del cliente valida: '%s'", client_display);
+          valido = true;
+        } else {
+          ESP_LOGW(TAG, "Linea del cliente invalida: '%s'", line);
+        }
+
+        line_len = 0;
+        continue;
       }
 
-      ESP_LOGW(TAG, "Linea del cliente invalida: '%s'", line);
+      if (line_len < sizeof(line) - 1) {
+        line[line_len++] = c;
+      }
     }
-
   }
 
   fclose(file);
+
+  if (valido) {
+    return true;
+  }
+
   if (!encontrado) {
     ESP_LOGW(TAG, "No se encontraron lineas en %s para validar el cliente.", log_path);
   }
@@ -867,8 +893,7 @@ static bool install_firmware_update(void) {
   const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
   if (update_partition == NULL) {
     const esp_partition_t *running_partition = esp_ota_get_running_partition();
-    ESP_LOGE(TAG, "No hay particion OTA disponible; firmware activo: %s",
-             running_partition != NULL ? running_partition->label : "desconocido");
+    ESP_LOGE(TAG, "No hay particion OTA disponible; firmware activo: %s", running_partition != NULL ? running_partition->label : "desconocido");
     ESP_LOGE(TAG, "Debe reflashearse la tabla de particiones OTA con 'idf.py flash'");
     fclose(file);
     return false;
@@ -1027,10 +1052,9 @@ static bool ensure_root_readme(void) {
     return false;
   }
 
-  const char *content =
-      "# Datalogger\n\n"
-      "Este archivo se crea automaticamente al inicializar la particion FAT.\n"
-      "La aplicacion puede guardar aqui logs y datos del sistema.\n";
+  const char *content = "# Datalogger\n\n"
+                        "Este archivo se crea automaticamente al inicializar la particion FAT.\n"
+                        "La aplicacion puede guardar aqui logs y datos del sistema.\n";
 
   size_t written = fwrite(content, 1, strlen(content), file);
   if (written != strlen(content)) {
@@ -1085,13 +1109,9 @@ static void battery_voltage_task(void *arg) {
   while (!modo_usb) {
     int battery_voltage_mv = hardware_read_battery_voltage_mv();
     if (!modo_usb && battery_voltage_mv >= 0) {
-     // ESP_LOGI(TAG, "Voltaje de bateria: %d mV (%.2f V)", battery_voltage_mv, battery_voltage_mv / 1000.0f);
+      ESP_LOGI(TAG, "Voltaje de bateria: %d mV (%.2f V)", battery_voltage_mv, battery_voltage_mv / 1000.0f);
       hardware_oled_show_battery(battery_voltage_mv);
-      if (battery_voltage_mv < BATTERY_LOW_AMARILLO_MV && battery_voltage_mv >= BATTERY_LOW_ROJO_MV) {
-        ESP_LOGW(TAG, "Bateria baja: aviso mostrado en OLED");
-      } else if (battery_voltage_mv < BATTERY_LOW_ROJO_MV) {
-        ESP_LOGW(TAG, "Bateria muy baja: aviso mostrado en OLED");
-      }
+
     } else {
       ESP_LOGE(TAG, "No se pudo leer el voltaje de bateria");
     }
@@ -1194,8 +1214,7 @@ static void rx_task(void *arg) {
             ESP_LOGI(TAG, "Cabecera detectada. Iniciando captura de tramas...");
             // El encabezado de Running tambien forma parte del log. Antes solo
             // se conservaba lo anterior a "seq #", descartando esta fila.
-            if (data_match_end_idx > 0 &&
-                !ring_buffer_write_all(data, data_match_end_idx)) {
+            if (data_match_end_idx > 0 && !ring_buffer_write_all(data, data_match_end_idx)) {
               ESP_LOGE(TAG, "Datos previos al loop descartados por falta de espacio en RAM.");
             }
             estado_grabado = 2;

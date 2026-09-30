@@ -10,8 +10,8 @@ Proyecto basado en ESP-IDF para capturar, guardar y exponer datos UART de una ce
 - Generación automática de la imagen FAT desde la carpeta `archivos` con `fatfs_create_spiflash_image`.
 - Modo USB automático cuando no llega la cabecera durante 5 segundos.
 - Exposición de la partición como pendrive por USB MSC (TinyUSB).
-- Actualización OTA desde un archivo `firmware.bin` colocado en la raíz del pendrive.
-- Monitor serie con voltaje de batería cada 5 segundos.
+- Actualización OTA desde `S3-DATALOGGER.bin` colocado en la raíz del pendrive.
+- Medición de batería cada 5 segundos, mostrada en el OLED y acompañada por avisos en el log serie cuando está baja.
 - OLED SSD1306 de 128x64 con batería y estado del sistema.
 
 ## Configuración actual del hardware
@@ -23,7 +23,9 @@ La implementación actual del código define estos valores:
 - RX: `GPIO18`
 - Velocidad: `300 bauds`
 - ADC de batería: `GPIO5` (`ADC1_CH4`)
-- Divisor de batería: `2.03`
+- Divisor de batería: `2.04`
+- Umbral de aviso amarillo: `4000 mV`
+- Umbral de aviso rojo: `3800 mV`
 - OLED: SSD1306 monocromo 128x64
 - SDA: `GPIO11`
 - SCL: `GPIO12`
@@ -65,7 +67,7 @@ La partición `archivos` se define en [partitions.csv](partitions.csv) con el si
 La partición FAT se monta como `/archivos` y se usa para guardar:
 
 - `/archivos/log_uart.txt`
-- `/archivos/firmware.bin`
+- `/archivos/S3-DATALOGGER.bin` (solo durante una actualización OTA)
 
 ## Compilar
 
@@ -114,7 +116,8 @@ Después de cada reinicio, el firmware arranca en modo datalogger y espera hasta
 - Captura datos UART.
 - Recolecta y compacta tramas.
 - Guarda el resultado en `/archivos/log_uart.txt`.
-- Muestra el voltaje en OLED y serie cada 5 segundos.
+- Mide el voltaje cada 5 segundos y lo muestra en el OLED.
+- Escribe un aviso en el monitor serie si la batería baja de los umbrales configurados.
 
 ### Modo USB
 
@@ -126,7 +129,7 @@ Después de cada reinicio, el firmware arranca en modo datalogger y espera hasta
 ## Actualización OTA desde pendrive
 
 1. Compila el firmware y genera `build/S3-DATALOGGER.bin`.
-2. Copia ese archivo al pendrive .
+2. Copia ese archivo a la raíz del pendrive conservando exactamente el nombre `S3-DATALOGGER.bin`.
 3. Expulsa la unidad desde Windows.
 4. Desconecta el cable USB-C.
 5. El sistema detecta la desconexión, valida la imagen y la instala en la OTA alternativa.
@@ -161,10 +164,18 @@ Antes de detectar el loop se conserva el flujo UART recibido para diagnóstico. 
 
 Cada línea se reconstruye desde el parser y se guarda en `/archivos/log_uart.txt` en lugar de registrar el bloque UART crudo completo.
 
+El archivo se almacena con todos los bits de cada byte invertidos (`byte almacenado = ~byte original`). Por eso puede no verse como texto legible al abrirlo directamente desde el PC. El firmware vuelve a invertir los bytes al leerlo para validar la línea de cliente. Para decodificar una copia en PowerShell:
+
+```powershell
+$bytes = [IO.File]::ReadAllBytes('.\\log_uart.txt')
+for ($i = 0; $i -lt $bytes.Length; $i++) { $bytes[$i] = [byte](-bnot $bytes[$i]) }
+[IO.File]::WriteAllBytes('.\\log_uart-decoded.txt', $bytes)
+```
+
 ## Datos clave del firmware
 
 - Proyecto: `S3-DATALOGGER`
-- Versión de firmware en pantalla: `FIRM 35`
+- Versión de firmware en pantalla: `FIRM 46`
 - Varios de estado y UI se gestionan desde [main/main.c](main/main.c)
 - Inicialización de hardware, periféricos y USB MSC en [main/hardware.c](main/hardware.c)
 - Pines, ADC y configuración OLED en [main/hardware.h](main/hardware.h)
@@ -201,6 +212,7 @@ Se añadió la transición automática a USB tras 5 segundos sin cabecera de la 
 - [main/hardware.h](main/hardware.h): pines y definiciones hardware
 - [partitions.csv](partitions.csv): tabla de particiones del flash
 - [archivos/README.md](archivos/README.md): detalle de la partición FAT generada por el proyecto
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): arquitectura, tareas y flujo de datos
 
 
 

@@ -149,9 +149,9 @@ Para actualizar el firmware desde USB:
    ```powershell
    idf.py build
    ```
-2. Copia el archivo `build/S3-DATALOGGER.bin` al pendrive con el nombre:
+2. Copia el archivo `build/S3-DATALOGGER.bin` al pendrive con el nombre exacto:
    ```text
-   firmware.bin
+   S3-DATALOGGER.bin
    ```
 3. Expulsa la unidad desde Windows.
 4. Desconecta el cable USB-C.
@@ -168,7 +168,9 @@ Este proyecto usa la siguiente configuración actual:
 - RX: `GPIO18`
 - velocidad: `300 bauds`
 - ADC batería: `GPIO5` (`ADC1_CH4`)
-- divisor de batería: `2.03`
+- divisor de batería: `2.04`
+- umbral amarillo: `4000 mV`
+- umbral rojo: `3800 mV`
 - OLED SSD1306 128x64
 - SDA: `GPIO11`
 - SCL: `GPIO12`
@@ -232,5 +234,6 @@ idf.py -p COM15 monitor
 - [main/hardware.c](main/hardware.c)
 - [partitions.csv](partitions.csv)
 - [archivos/README.md](archivos/README.md)
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 Si quieres, puedo dejarte también una versión de esta guía en formato más corto para imprimir o una versión enfocada solo a “primer arranque del equipo”.

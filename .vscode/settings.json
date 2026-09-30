@@ -22,7 +22,6 @@
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
   ],
-  "idf.portWin": "COM15",
   "idf.currentSetup": "C:\\esp\\v6.1\\esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
@@ -33,5 +32,6 @@
     "--query-driver=**",
     "--compile-commands-dir=c:\\DATALOGGER\\S3-DATALOGGER\\build"
   ],
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.port": "COM15"
 }

@@ -725,7 +725,7 @@ static esp_err_t init_storage(void) {
                       TAG, "No se pudo crear el almacenamiento MSC");
 
 #if CONFIG_FATFS_USE_LABEL
-  f_setlabel("ASIGNA_DL");
+  f_setlabel("ROITECH_DL");
 #endif
 
   ESP_LOGI(TAG, "Modo logger activo; FAT montado en /archivos");
